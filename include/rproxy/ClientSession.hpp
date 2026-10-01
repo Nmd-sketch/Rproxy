@@ -8,11 +8,11 @@
 #include <boost/system/system_error.hpp>
 #include <boost/version.hpp>
 #include <boost/asio/ssl.hpp>
+#include "Server.hpp"
 namespace net = boost::asio;
 namespace beast = boost::beast;
 namespace http = beast::http;
 namespace sys = boost::system;
-
 
 class ClientSession : public std::enable_shared_from_this<ClientSession> {
 	beast::flat_buffer m_buf;
@@ -20,6 +20,8 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
 	http::request<http::string_body> m_req;
 	http::response<http::string_body> m_resp;
 	net::ip::tcp::socket m_socket;
+	Server* m_serv_ref;
+
 
 	// We construct the stream as a thin wrapper around a reference to the socket,
 	// if the connection isn't actually TLS we simply don't use it
@@ -42,8 +44,8 @@ class ClientSession : public std::enable_shared_from_this<ClientSession> {
 	void send_tls_response();
 
 public:
-	ClientSession(net::ip::tcp::socket socket, net::ssl::context& ssl_ctx) : m_socket(std::move(socket)), m_ssl_ctx(ssl_ctx),
-	m_ssl_stream(m_socket, ssl_ctx){}
+	ClientSession(net::ip::tcp::socket socket, net::ssl::context& ssl_ctx, Server* s_ref) : m_socket(std::move(socket)), m_ssl_ctx(ssl_ctx),
+	m_ssl_stream(m_socket, ssl_ctx), m_serv_ref(s_ref) {}
 
 	void start();
 
