@@ -50,7 +50,14 @@ if(POLICY CMP0167)
 endif()
 
 find_package(Boost REQUIRED COMPONENTS beast asio)
-target_link_libraries(rproxy_deps INTERFACE Boost::beast Boost::asio)
+find_package(OpenSSL 3.0 REQUIRED)
+message(STATUS "OpenSSL: ${OPENSSL_VERSION} (${OPENSSL_INCLUDE_DIR})")
+
+target_link_libraries(rproxy_deps INTERFACE
+    Boost::beast
+    Boost::asio
+    OpenSSL::SSL
+    OpenSSL::Crypto)
 
 if(WIN32)
     target_link_libraries(rproxy_deps INTERFACE ws2_32 mswsock)
@@ -60,7 +67,7 @@ if(MINGW)
     target_link_options(rproxy_deps INTERFACE -static)
 endif()
 
-add_executable(rproxy src/main.cpp)
+add_executable(rproxy src/main.cpp src/ClientSession.cpp)
 target_link_libraries(rproxy PRIVATE rproxy_deps)
 
 include(FetchContent)
