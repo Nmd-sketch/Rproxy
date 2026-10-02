@@ -1,6 +1,9 @@
 add_executable(rproxy_tests
     smoke_test.cpp
-    tls_test.cpp)
+    tls_test.cpp
+    RequestToolsTests.cpp
+    ../src/RequestTools.cpp
+)
 
 target_link_libraries(rproxy_tests PRIVATE
     rproxy_deps
