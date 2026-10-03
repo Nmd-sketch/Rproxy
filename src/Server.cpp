@@ -1,12 +1,34 @@
 #include "../include/rproxy/Server.hpp"
-#include "../include/rproxy/ClientSession.hpp"
+#include "../include/rproxy/TlsSession.hpp"
+#include "../include/rproxy/PlainSession.hpp"
+#include <memory>
 #include <iostream>
 
+//@Refactor: Add CRTP ClientSession class to avoid runtime dispatch and branching
 void Server::accept() {
 	m_acceptor.async_accept([this](const sys::error_code& ec, net::ip::tcp::socket client) {
+            
+            auto buf = std::make_shared<beast::flat_buffer>();
+            auto socket = std::make_shared<net::ip::tcp::socket>(std::move(client));
 
 			if (!ec) {
-				std::make_shared<ClientSession>(std::move(client), this->m_ssl_ctx, this)->start();
+                beast::async_detect_ssl(*socket, *buf, 
+                        [this, socket, buf] (const beast::error_code ec, bool result) mutable {
+                            
+                            if (ec) {
+                                std::cerr << "SSL detection error\n";
+                                return;
+                            }
+                            
+                            if (result) {
+                                std::make_shared<TlsSession>(std::move(*socket), this->m_ssl_ctx, this, std::move(*buf))->start();
+                            } else {
+                                std::make_shared<PlainSession>(std::move(*socket), this, std::move(*buf))->start();
+                            }
+
+                        }
+                );
+
 			} else {
 				std::cerr << "Error accepting client: " << ec.what() << '\n';
 			}
@@ -18,8 +40,6 @@ void Server::accept() {
 
 
 void Server::start() {
-	// @Refactor: Temporally running in port 8080, later change the port on which the
-	// server is running
 	std::cout << "Server running in port 8080" << '\n';
 	this->accept();
 	auto guard = net::make_work_guard(this->m_io_ctx);
