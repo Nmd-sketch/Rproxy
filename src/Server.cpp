@@ -21,7 +21,7 @@ void Server::accept() {
                             }
                             
                             if (result) {
-                                std::make_shared<TlsSession>(std::move(*socket), this->m_ssl_ctx, this, std::move(*buf))->start();
+                                std::make_shared<TlsSession>(net::ssl::stream<net::ip::tcp::socket>(std::move(*socket), this->m_ssl_ctx), this, std::move(*buf))->start();
                             } else {
                                 std::make_shared<PlainSession>(std::move(*socket), this, std::move(*buf))->start();
                             }

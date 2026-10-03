@@ -1,18 +1,9 @@
 #pragma once
-#include "BaseSession.hpp"
+#include "SessionBase.hpp"
 
-class TlsSession : public BaseSession<TlsSession> {
-    net::ssl::stream<net::ip::tcp::socket> m_ssl_stream;
-    beast::flat_buffer m_buf;
-
-    void do_tls_handshake();
-    void read_request();
-    void send_response();
+class TlsSession : public SessionBase<TlsSession, net::ssl::stream<net::ip::tcp::socket>> {
+    using Base = SessionBase<TlsSession, net::ssl::stream<net::ip::tcp::socket>>;
 
 public:
-    TlsSession(net::ip::tcp::socket&& socket, net::ssl::context& ssl_ctx, Server* s_ref, beast::flat_buffer buf = {}) : BaseSession<TlsSession>(s_ref), 
-    m_ssl_stream(std::move(socket), ssl_ctx),
-    m_buf(std::move(buf)) {}
-
-    void start();
+    using Base::Base;
 };
