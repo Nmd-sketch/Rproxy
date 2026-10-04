@@ -30,10 +30,19 @@ namespace RequestTools {
 
     // @Preconditions: A valid http request is passed to the function
     // @Postconditions: A valid http request is returned with the following headers set:
-    // - X-Forwarded-For: Appends the client's address. If the header already exists, the new ip is appended
+    // - X-Forwarded-For: Set to the client's address. Any client supplied value is overwritten.
     // - X-Forwarded-Proto: Set to https if the client uses TLS, set to http otherwise
     // - X-Forwarded-Host: Set to the original host value from the client request
     // The function does not return any value
+    //
+    // @Usage: Must be called AFTER make_clean_request, never before it.
+    // - headers_lookup_table lists x_forwarded_for among the hop by hop headers, so
+    //   make_clean_request erases it. Calling this first means make_clean_request then
+    //   deletes the value set here and X-Forwarded-For silently disappears upstream.
+    // - Callers must assign to the returned object; this function mutates in place and
+    //   returns nothing, so the request passed in is the one that is modified.
+    // - client_ip is taken from the downstream socket, not the upstream one.
+    // - conn_type is "http" or "https", chosen from whether the client leg negotiated TLS.
     void append_x_headers(http::request<http::string_body>& req, std::string_view client_ip, std::string_view conn_type);
 
 

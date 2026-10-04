@@ -1,5 +1,7 @@
 #include "../include/rproxy/RequestTools.hpp"
 #include <unordered_set>
+#include <string>
+#include <vector>
 
 //Lookup table for erasing the standard hop by hop headers
 std::unordered_set<http::field> headers_lookup_table{
@@ -21,8 +23,13 @@ http::request<http::string_body> RequestTools::make_clean_request(http::request<
     // First check what the client wants us to erase, specified in the connection field
     auto conn_it = req.find(http::field::connection);
     if (conn_it != req.end()) {
+        std::vector<std::string> temp;
         for (auto token : http::token_list(conn_it->value())) {
-            req.erase(token);
+            temp.push_back(token);
+        }
+
+        for (const auto& name : temp) {
+            req.erase(name);
         }
     }
     
@@ -44,8 +51,13 @@ http::response<http::string_body> RequestTools::make_clean_response(http::respon
 
     auto conn_it = resp.find(http::field::connection);
     if (conn_it != resp.end()) {
+        std::vector<std::string> temp;
         for (auto token : http::token_list(conn_it->value())) {
-            resp.erase(token);
+            temp.push_back(token);
+        }
+        
+        for (const auto& name : temp) {
+            resp.erase(name);
         }
     }
     

@@ -22,23 +22,22 @@ namespace sys = boost::system;
 // too malformed to read a version, pass http::version::11.
 namespace ErrorResponse {
 
+    http::response<http::string_body> make_error_400(unsigned version);
 
-http::response<http::string_body> make_error_400(unsigned version);
+    http::response<http::string_body> make_error_400_framing_conflict(unsigned version);
 
-http::response<http::string_body> make_error_400_framing_conflict(unsigned version);
+    http::response<http::string_body> make_error_413(std::size_t max_payload_size_bytes,
+                                                     unsigned version);
 
-http::response<http::string_body> make_error_413(std::size_t max_payload_size_bytes,
-                                                 unsigned version);
+    http::response<http::string_body> make_error_431(std::string_view header_name,
+                                                     unsigned version);
 
-http::response<http::string_body> make_error_431(std::string_view header_name,
-                                                 unsigned version);
+    http::response<http::string_body> make_error_500(unsigned version);
 
-http::response<http::string_body> make_error_500(unsigned version);
+    http::response<http::string_body> make_error_502(unsigned version);
 
-http::response<http::string_body> make_error_502(unsigned version);
+    http::response<http::string_body> make_error_503(unsigned version);
 
-http::response<http::string_body> make_error_503(unsigned version);
+    http::response<http::string_body> make_error_504(unsigned version);
 
-http::response<http::string_body> make_error_504(unsigned version);
-
-}  // namespace ErrorResponse
+} 

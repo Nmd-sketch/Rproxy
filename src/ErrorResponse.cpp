@@ -5,48 +5,48 @@
 
 namespace {
 
-std::string json_escape(std::string_view in) {
-    std::string out;
-    out.reserve(in.size());
+    std::string json_escape(std::string_view in) {
+        std::string out;
+        out.reserve(in.size());
 
-    for (const char c : in) {
-        switch (c) {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\b': out += "\\b";  break;
-            case '\f': out += "\\f";  break;
-            case '\n': out += "\\n";  break;
-            case '\r': out += "\\r";  break;
-            case '\t': out += "\\t";  break;
-            default:
-                if (static_cast<unsigned char>(c) < 0x20) {
-                    char buf[7];
-                    std::snprintf(buf, sizeof(buf), "\\u%04x",
-                                  static_cast<unsigned>(static_cast<unsigned char>(c)));
-                    out += buf;
-                } else {
-                    out += c;
-                }
+        for (const char c : in) {
+            switch (c) {
+                case '"':  out += "\\\""; break;
+                case '\\': out += "\\\\"; break;
+                case '\b': out += "\\b";  break;
+                case '\f': out += "\\f";  break;
+                case '\n': out += "\\n";  break;
+                case '\r': out += "\\r";  break;
+                case '\t': out += "\\t";  break;
+                default:
+                    if (static_cast<unsigned char>(c) < 0x20) {
+                        char buf[7];
+                        std::snprintf(buf, sizeof(buf), "\\u%04x",
+                                      static_cast<unsigned>(static_cast<unsigned char>(c)));
+                        out += buf;
+                    } else {
+                        out += c;
+                    }
+            }
         }
+
+        return out;
     }
 
-    return out;
-}
+    http::response<http::string_body> make_json(http::status status, std::string_view slug,
+                                                std::string_view message, unsigned version) {
+        http::response<http::string_body> resp;
 
-http::response<http::string_body> make_json(http::status status, std::string_view slug,
-                                            std::string_view message, unsigned version) {
-    http::response<http::string_body> resp;
+        resp.result(status);
+        resp.version(version);
+        resp.set(http::field::content_type, "application/json");
+        resp.keep_alive(false);
+        resp.body() = std::string("{\"error\": \"") + json_escape(slug) +
+                      "\", \"message\": \"" + json_escape(message) + "\"}";
+        resp.prepare_payload();
 
-    resp.result(status);
-    resp.version(version);
-    resp.set(http::field::content_type, "application/json");
-    resp.keep_alive(false);
-    resp.body() = std::string("{\"error\": \"") + json_escape(slug) +
-                  "\", \"message\": \"" + json_escape(message) + "\"}";
-    resp.prepare_payload();
-
-    return resp;
-}
+        return resp;
+    }
 
 }  // namespace
 

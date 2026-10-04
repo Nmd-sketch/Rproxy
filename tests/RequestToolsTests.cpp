@@ -90,6 +90,45 @@ TEST(MakeCleanRequest, ConnectionNamedHeadersAreCaseInsensitive) {
     EXPECT_EQ(cleaned.count(http::field::connection), 0);
 }
 
+TEST(MakeCleanRequest, ConnectionNamingItselfDoesNotInvalidateTheTokenList) {
+    http::request<http::string_body> req;
+    req.method(http::verb::get);
+    req.target("/");
+    req.version(11);
+    req.set(http::field::host, "example.com");
+
+    // The token list names "connection" itself, so erasing it while iterating the list
+    // would leave token_list's internal string_view dangling.
+    req.set(http::field::connection, "connection");
+    req.set("X-Keep-Me", "yes");
+
+    auto cleaned = RequestTools::make_clean_request(req);
+
+    EXPECT_EQ(cleaned.count(http::field::connection), 0);
+    EXPECT_EQ(cleaned.count("X-Keep-Me"), 1);
+    EXPECT_EQ(cleaned.count(http::field::host), 1);
+}
+
+TEST(MakeCleanRequest, SelfNamingConnectionHeaderWithSurroundingTokens) {
+    http::request<http::string_body> req;
+    req.method(http::verb::get);
+    req.target("/");
+    req.version(11);
+    req.set(http::field::host, "example.com");
+
+    req.set(http::field::connection, "keep-alive, connection, close, upgrade");
+    req.set(http::field::keep_alive, "timeout=5");
+    req.set(http::field::upgrade, "websocket");
+    req.set("X-Keep-Me", "yes");
+
+    auto cleaned = RequestTools::make_clean_request(req);
+
+    EXPECT_EQ(cleaned.count(http::field::connection), 0);
+    EXPECT_EQ(cleaned.count(http::field::keep_alive), 0);
+    EXPECT_EQ(cleaned.count(http::field::upgrade), 0);
+    EXPECT_EQ(cleaned.count("X-Keep-Me"), 1);
+}
+
 TEST(MakeCleanRequest, PreservesHostHeader) {
     http::request<http::string_body> req;
     req.method(http::verb::get);
@@ -160,6 +199,23 @@ TEST(MakeCleanResponse, RemovesConnectionNamedHeaders) {
     EXPECT_EQ(cleaned.count("X-Backend-Node"), 0);
     EXPECT_EQ(cleaned.count(http::field::connection), 0);
     EXPECT_EQ(cleaned.count("X-Survives"), 1);
+}
+
+TEST(MakeCleanResponse, SelfNamingConnectionHeaderDoesNotInvalidateTheTokenList) {
+    http::response<http::string_body> resp;
+    resp.result(http::status::ok);
+    resp.version(11);
+    resp.set(http::field::server, "origin/1.0");
+    resp.set(http::field::content_type, "text/plain");
+
+    resp.set(http::field::connection, "close, connection");
+    resp.set("X-Keep-Me", "yes");
+
+    auto cleaned = RequestTools::make_clean_response(resp);
+
+    EXPECT_EQ(cleaned.count(http::field::connection), 0);
+    EXPECT_EQ(cleaned.count("X-Keep-Me"), 1);
+    EXPECT_EQ(cleaned.count(http::field::server), 1);
 }
 
 TEST(MakeCleanResponse, DoesNotAddXForwardedHeaders) {
