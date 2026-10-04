@@ -67,7 +67,8 @@ if(MINGW)
     target_link_options(rproxy_deps INTERFACE -static)
 endif()
 
-add_executable(rproxy src/main.cpp src/Server.cpp src/RequestTools.cpp)
+add_executable(rproxy src/main.cpp src/Server.cpp src/RequestTools.cpp
+                src/ErrorResponse.cpp)
 target_link_libraries(rproxy PRIVATE rproxy_deps)
 
 include(FetchContent)

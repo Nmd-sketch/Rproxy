@@ -4,6 +4,8 @@ add_executable(rproxy_tests
     RequestToolsTests.cpp
     ../src/RequestTools.cpp
     ConfigTests.cpp
+    ErrorResponseTests.cpp
+    ../src/ErrorResponse.cpp
 )
 
 target_link_libraries(rproxy_tests PRIVATE
