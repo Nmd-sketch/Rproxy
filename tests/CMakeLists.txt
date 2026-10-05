@@ -7,7 +7,6 @@ add_executable(rproxy_tests
     ErrorResponseTests.cpp
     ../src/ErrorResponse.cpp
     LoadBalancerTests.cpp
-    ../src/LoadBalancer.cpp
     ProxyTests.cpp
     ../src/Server.cpp
 )

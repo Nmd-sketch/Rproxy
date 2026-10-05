@@ -68,7 +68,7 @@ if(MINGW)
 endif()
 
 add_executable(rproxy src/main.cpp src/Server.cpp src/RequestTools.cpp
-                src/ErrorResponse.cpp src/LoadBalancer.cpp)
+                src/ErrorResponse.cpp)
 target_link_libraries(rproxy PRIVATE rproxy_deps)
 
 include(FetchContent)
