@@ -11,19 +11,36 @@ void Server::accept() {
             auto socket = std::make_shared<net::ip::tcp::socket>(std::move(client));
 
 			if (!ec) {
-                beast::async_detect_ssl(*socket, *buf, 
-                        [this, socket, buf] (const beast::error_code ec, bool result) mutable {
-                            
+                // @Usage: Captured here because this is the last point where the raw
+                // socket exists. Once wrapped in an ssl_stream the IP would need
+                // next_layer() on one type and the socket itself on the other.
+                std::string client_ip;
+                {
+                    sys::error_code ep_ec;
+                    const auto ep = socket->remote_endpoint(ep_ec);
+                    if (!ep_ec) {
+                        client_ip = ep.address().to_string();
+                    }
+                }
+
+                beast::async_detect_ssl(*socket, *buf,
+                        [this, socket, buf, client_ip] (const beast::error_code ec, bool result) mutable {
+
                             if (ec) {
                                 std::cerr << "SSL detection error\n";
                                 return;
                             }
-                            
+
+                            const HostData* upstream = this->load_balancer().next();
+
                             if (result) {
                                 std::make_shared<TlsSession>(net::ssl::stream<net::ip::tcp::socket>(std::move(*socket),
-                                            this->m_ssl_ctx), this, std::move(*buf))->start();
+                                            this->m_ssl_ctx), this, std::move(*buf),
+                                            std::move(client_ip), upstream)->start();
                             } else {
-                                std::make_shared<PlainSession>(std::move(*socket), this, std::move(*buf))->start();
+                                std::make_shared<PlainSession>(std::move(*socket), this,
+                                            std::move(*buf), std::move(client_ip),
+                                            upstream)->start();
                             }
 
                         }

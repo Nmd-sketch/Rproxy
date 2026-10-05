@@ -37,6 +37,17 @@ protected:
     http::request<http::string_body> m_req;
     Server* m_serv_ref;
 
+    // @Usage: Second leg. Default constructed and connected later, because the
+    // upstream is not known until the request has been read and routed.
+    // @Usage: Second leg. Default constructed and connected later, because the
+    // upstream is not known until the request has been read and routed.
+    // @Correctness: A tcp::socket has no default constructor, so it is built
+    // closed and opened by async_connect later.
+    net::ip::tcp::socket m_up{m_serv_ref->io_context()};
+    beast::flat_buffer m_up_buf;
+    const HostData* m_upstream;
+    std::string m_client_ip;
+
     void read_request() noexcept {
         auto self = this->shared_from_this();
 
@@ -91,8 +102,10 @@ protected:
     }
 
 public:
-    SessionBase(DownStream&& down, Server* s_ref, beast::flat_buffer buf = {})
-        : m_down(std::move(down)), m_buf(std::move(buf)), m_serv_ref(s_ref) {}
+    SessionBase(DownStream&& down, Server* s_ref, beast::flat_buffer buf = {},
+                std::string client_ip = {}, const HostData* upstream = nullptr)
+        : m_down(std::move(down)), m_buf(std::move(buf)), m_serv_ref(s_ref),
+          m_client_ip(std::move(client_ip)), m_upstream(upstream) {}
 
     void start() {
         if constexpr (is_ssl_stream_v<DownStream>) {
