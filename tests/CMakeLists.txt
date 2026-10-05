@@ -6,6 +6,8 @@ add_executable(rproxy_tests
     ConfigTests.cpp
     ErrorResponseTests.cpp
     ../src/ErrorResponse.cpp
+    LoadBalancerTests.cpp
+    ../src/LoadBalancer.cpp
 )
 
 target_link_libraries(rproxy_tests PRIVATE
