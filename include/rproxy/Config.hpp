@@ -184,10 +184,9 @@ class Config {
             const std::string host = read_string(*t, "host", ctx, "", errors);
             const auto port_value = read_int(*t, "port", ctx, kMinPort, kMaxPort, 0, errors);
 
-            // @Usage: tls = true is rejected rather than accepted and ignored. The
-            // upstream leg is a plain tcp::socket, so honouring the flag is M5 work.
-            // Silently sending plaintext to a TLS port and reporting 502 with an
-            // "invalid response" message would blame the origin for our own gap.
+            // @Refactor: parsed and validated, but not yet honoured. The upstream leg is a
+            // plain tcp::socket, so a tls = true upstream still receives plaintext
+            // until M5 dispatches on uses_tls at accept time, per Server::accept.
             const bool upstream_tls = read_bool(*t, "tls", ctx, false, errors);
 
             if (errors.size() != before) {

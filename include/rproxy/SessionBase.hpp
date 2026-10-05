@@ -75,10 +75,13 @@ protected:
                     return;
                 }
 
-                // @Correctness: The session is shared_ptr owned, and the timer handler
-                // holds one reference. Cancelling here lets an in-flight operation
-                // finish and deliver its own error, so there is no window where a
-                // handler runs against a torn-down session.
+                // @Refactor: cancel() here cancels the timer only, not the socket
+                // operation it was guarding. If the deadline fires while an upstream
+                // read is pending, that read stays in flight and can still complete
+                // later, writing a second response after this 504. No test reaches it:
+                // a silent origin closes once the deadline passes, so the second write
+                // just fails. Closing the in flight operation on timeout needs session
+                // lifecycle changes that arrive with M7.
                 self->m_deadline.cancel();
                 std::cerr << "Upstream step timed out\n";
                 self->send_error(ErrorResponse::make_error_504(self->m_req.version()));
@@ -137,20 +140,27 @@ protected:
 
     void connect_upstream() {
         auto self = this->shared_from_this();
-
-        self->arm_deadline(self->m_serv_ref->config().get_connect_ms());
-
+        
+        //@Correctness: If there are no upstreams we cannot serve the request right now
+        //so we send error 503 back to the client. But this only should happen if there
+        //are absolutely no upstreams, if there is at least 1 upstream available we should
+        //route to that one
         if (self->m_upstream == nullptr) {
             std::cerr << "No upstream available\n";
             self->send_error(ErrorResponse::make_error_503(self->m_req.version()));
             return;
         }
 
+        self->arm_deadline(self->m_serv_ref->config().get_connect_ms());
+
         self->m_serv_ref->load_balancer().resolver().async_resolve(
             self->m_upstream->host,
             std::to_string(self->m_upstream->port),
             [self] (const sys::error_code& ec, net::ip::tcp::resolver::results_type results) {
-
+               
+                //@Fix: A resolve or connect failure handles error 502 without retrying with
+                //another possibly healthy upstream. This feature will be implemented in another
+                //iteration, for now we just stick with this.
                 if (ec) {
                     std::cerr << "Upstream resolve failed: " << ec.message() << '\n';
                     self->disarm_deadline();

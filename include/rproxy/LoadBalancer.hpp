@@ -24,6 +24,7 @@ public:
         if (upstreams.empty()) {
             return nullptr;
         }
+
         const auto index = m_counter.fetch_add(1, std::memory_order_relaxed);
         // @Usage: Skips unhealthy upstreams, bounded by the list length so an all
         // unhealthy list still returns nullptr rather than spinning. Consulted here, not

@@ -31,13 +31,10 @@ namespace {
 // A socket already listening on an ephemeral port.
 struct TCPListener {
     net::io_context ctx;
-    net::ip::tcp::acceptor acceptor{ctx};
+    net::ip::tcp::acceptor acceptor;
 
-    TCPListener() {
-        acceptor.open(net::ip::tcp::v4());
+    TCPListener() : acceptor(ctx, net::ip::tcp::endpoint(net::ip::tcp::v4(), 0)) {
         acceptor.set_option(net::socket_base::reuse_address(true));
-        acceptor.bind(net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
-        acceptor.listen();
     }
 
     void close() {
@@ -50,7 +47,6 @@ struct TCPListener {
     }
 };
 
-// A looping origin that replies with a fixed body and records the last request it saw.
 // A looping origin that replies with a fixed body and records the last request it saw.
 //
 // The listener is owned by a shared_ptr and closed in the destructor, which makes the
