@@ -9,13 +9,15 @@
 #include <boost/asio/ssl.hpp>
 #include <iostream>
 #include "../include/rproxy/Server.hpp"
-namespace net = boost::asio;
-namespace beast = boost::beast;
-namespace http = beast::http;
-namespace sys = boost::system;
+#include "../include/rproxy/Config.hpp"
 
 int main()
 {
-	Server s(8080);
-	s.start();
+	try {
+		Server s("config.toml");
+		s.start();
+	} catch (const ConfigError& e) {
+		std::cerr << e.what() << '\n';
+		return 1;
+	}
 }

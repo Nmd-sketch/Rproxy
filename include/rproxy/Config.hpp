@@ -45,13 +45,13 @@ class Config {
     static constexpr std::uint16_t kMinPort = 1;
     static constexpr std::uint16_t kMaxPort = 65535;
 
-    static std::string type_name(toml::node_type type) {
+    std::string type_name(toml::node_type type) {
         std::ostringstream out;
         out << type;
         return out.str();
     }
 
-    static void require_table(const toml::table& tbl, std::string_view key, std::string_view path,
+    void require_table(const toml::table& tbl, std::string_view key, std::string_view path,
                               std::vector<std::string>& errors) {
         const auto node = tbl[key];
         if (static_cast<bool>(node) && !node.is_table()) {
@@ -59,18 +59,18 @@ class Config {
         }
     }
 
-    static toml::table load_file(const std::string& config_path) {
+    toml::table load_file(std::string_view config_path) {
         try {
             return toml::parse_file(config_path);
         } catch (const toml::parse_error& e) {
-            throw ConfigError("Failed to load configuration file '" + config_path +
+            throw ConfigError("Failed to load configuration file '" + std::string(config_path) +
                               "':\n" + std::string(e.description()) +
                               "\n  (line " + std::to_string(e.source().begin.line) +
                               ", column " + std::to_string(e.source().begin.column) + ")");
         }
     }
 
-    static std::int64_t read_int(const toml::table& tbl, std::string_view key,
+    std::int64_t read_int(const toml::table& tbl, std::string_view key,
                                  std::string_view ctx, std::int64_t lo, std::int64_t hi,
                                  std::int64_t fallback, std::vector<std::string>& errors) {
         const auto node = tbl[key];
@@ -101,7 +101,7 @@ class Config {
         return *value;
     }
 
-    static std::string read_string(const toml::table& tbl, std::string_view key,
+    std::string read_string(const toml::table& tbl, std::string_view key,
                                    std::string_view ctx, std::string fallback,
                                    std::vector<std::string>& errors) {
         const auto node = tbl[key];
@@ -125,7 +125,7 @@ class Config {
         return *value;
     }
 
-    static bool read_bool(const toml::table& tbl, std::string_view key,
+    bool read_bool(const toml::table& tbl, std::string_view key,
                           std::string_view ctx, bool fallback, std::vector<std::string>& errors) {
         const auto node = tbl[key];
         if (!static_cast<bool>(node)) {
@@ -148,7 +148,7 @@ class Config {
         return *value;
     }
 
-    static void load_upstreams(const toml::table& root, std::vector<HostData>& out,
+    void load_upstreams(const toml::table& root, std::vector<HostData>& out,
                                std::vector<std::string>& errors) {
         const auto node = root["upstream"];
         if (!static_cast<bool>(node)) {
@@ -263,7 +263,7 @@ public:
         }
     }
 
-    explicit Config(const std::string& config_path) : Config(load_file(config_path)) {}
+    explicit Config(std::string_view config_path) : Config(load_file(config_path)) {}
 
     std::uint16_t get_port() const noexcept { return port; }
     std::size_t get_thread_num() const noexcept { return thread_num; }

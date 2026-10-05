@@ -4,7 +4,6 @@
 #include <memory>
 #include <iostream>
 
-//@Refactor: Add CRTP ClientSession class to avoid runtime dispatch and branching
 void Server::accept() {
 	m_acceptor.async_accept([this](const sys::error_code& ec, net::ip::tcp::socket client) {
             
@@ -21,7 +20,8 @@ void Server::accept() {
                             }
                             
                             if (result) {
-                                std::make_shared<TlsSession>(net::ssl::stream<net::ip::tcp::socket>(std::move(*socket), this->m_ssl_ctx), this, std::move(*buf))->start();
+                                std::make_shared<TlsSession>(net::ssl::stream<net::ip::tcp::socket>(std::move(*socket),
+                                            this->m_ssl_ctx), this, std::move(*buf))->start();
                             } else {
                                 std::make_shared<PlainSession>(std::move(*socket), this, std::move(*buf))->start();
                             }

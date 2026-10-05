@@ -12,6 +12,7 @@
 #include <boost/system/system_error.hpp>
 #include <boost/version.hpp>
 #include <boost/asio/ssl.hpp>
+#include "ErrorResponse.hpp"
 #include "Server.hpp"
 
 namespace net = boost::asio;
@@ -36,16 +37,26 @@ protected:
     http::request<http::string_body> m_req;
     Server* m_serv_ref;
 
-    void read_request() {
+    void read_request() noexcept {
         auto self = this->shared_from_this();
 
         http::async_read(m_down, m_buf, self->m_req,
-            [self] (const beast::error_code ec, std::size_t bytes_read) {
+            [self] (const beast::error_code ec, std::size_t) {
 
                 if (ec) {
                     std::cerr << "Error parsing the http request (" << ec.message() << "), dropping the connection...\n";
+                    auto error_response = ErrorResponse::make_error_400(10);
+                    http::async_write(self->m_down, error_response, 
+                            [self] (const beast::error_code ec, std::size_t bytes) {
+
+                            if (ec) {
+                                std::cerr << "Error sending response\n";
+                            }
+                        }
+                    );
                     return;
                 }
+
                 std::cout << "The read handler has been called!\n";
 
                 self->send_response();
@@ -53,7 +64,7 @@ protected:
         );
     }
 
-    void send_response() {
+    void send_response() noexcept {
         auto self = this->shared_from_this();
 
         http::response<http::string_body> resp;
@@ -63,12 +74,17 @@ protected:
         resp.prepare_payload();
 
         http::async_write(m_down, resp,
-            [self] (const beast::error_code ec, std::size_t bytes) {
+            [self] (const beast::error_code ec, std::size_t) {
 
                 if (ec) {
+                    // @Correctness: A failed write means the client is already gone or the
+                    // connection is broken, so there is no channel left to report this
+                    // on. Log it and let the session die rather than attempting another
+                    // write to the same dead stream, which cannot succeed either.
                     std::cerr << "Error sending the http response to the client\n";
                     return;
                 }
+
                 self->m_serv_ref->debug_fn();
             }
         );
@@ -101,5 +117,5 @@ public:
         }
     }
 
-    Derived* self() { return static_cast<Derived*>(this); };
+    Derived* self() noexcept { return static_cast<Derived*>(this); };
 };

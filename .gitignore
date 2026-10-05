@@ -7,3 +7,4 @@ CMakeUserPresets.json
 *.o
 *.a
 *.exe
+.clangd
