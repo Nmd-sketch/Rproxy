@@ -1,15 +1,11 @@
 #pragma once
 
-#include <boost/asio/buffer.hpp>
-#include <boost/asio/io_context.hpp>
-#include <boost/asio/ip/tcp.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
-#include <boost/beast/version.hpp>
 #include <boost/system/system_error.hpp>
 #include <boost/version.hpp>
-#include <boost/asio/ssl.hpp>
 #include <cstddef>
+#include <string>
 #include <string_view>
 
 namespace net = boost::asio;
@@ -43,11 +39,11 @@ namespace ErrorResponse {
                                                      unsigned version);
 
     // @Usage: The request headers exceeded limits.header_bytes, either in total or
-    // in one field. Pass the offending field name when it is known so the client can
-    // find it; pass a placeholder such as "request headers" when it is not, which is
-    // the common case.
-    http::response<http::string_body> make_error_431(std::string_view header_name,
-                                                     unsigned version);
+    // in one field. There is no field name parameter because the parser cannot supply
+    // one: header_limit applies to the whole header block, so the offending field is
+    // not identified. That keeps the message honest instead of naming a field we are
+    // only guessing at.
+    http::response<http::string_body> make_error_431(unsigned version);
 
     // @Usage: A bug in the proxy itself, such as an unexpected exception or an
     // internal invariant that did not hold. Never use this for a failure caused by
@@ -72,5 +68,20 @@ namespace ErrorResponse {
     // timeouts.read_ms. Only usable once timeouts exist; until then a slow origin
     // hangs the connection instead of producing this.
     http::response<http::string_body> make_error_504(unsigned version);
+
+    namespace detail {
+
+        // @Usage: Escapes a string for embedding inside a JSON string literal. This is
+        // the only thing standing between a hostile input and a malformed error body,
+        // so it is reachable from tests rather than hidden: no factory currently takes
+        // caller supplied text, which would otherwise leave this untested.
+        //
+        // @Correctness: Characters below 0x20 are emitted as \uXXXX rather than dropped,
+        // so a raw newline or tab can never break the single line JSON body. Bytes at or
+        // above 0x20 pass through, including UTF-8 continuation bytes, which are already
+        // valid inside a JSON string.
+        std::string json_escape(std::string_view in);
+
+    }  // namespace detail
 
 } 

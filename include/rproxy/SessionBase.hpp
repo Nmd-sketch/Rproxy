@@ -34,7 +34,36 @@ struct is_ssl_stream<net::ssl::stream<NextLayer>> : std::true_type {};
 template <typename T>
 inline constexpr bool is_ssl_stream_v = is_ssl_stream<T>::value;
 
-template <typename Derived, typename DownStream>
+// @Usage: async_connect has to be handed the layer that actually owns the socket.
+// For a plain upstream that is the stream itself; for a TLS upstream it is the
+// tcp::socket wrapped by the ssl::stream. Partial ordering picks the second
+// overload whenever the argument is an ssl::stream.
+template <typename Stream>
+Stream& lowest_layer(Stream& stream) noexcept {
+    return stream;
+}
+
+template <typename NextLayer>
+NextLayer& lowest_layer(net::ssl::stream<NextLayer>& stream) noexcept {
+    return stream.next_layer();
+}
+
+// @Usage: Builds the second leg at construction time. Neither leg type is
+// default constructible: a tcp::socket needs an io_context, and an ssl::stream
+// needs the context on top of that (stream.hpp, the stream(Arg&&, context&)
+// constructor). Constructing here keeps the member a value rather than forcing
+// every call site to assemble and move one in.
+template <typename Upstream>
+Upstream make_upstream(Server* s_ref) {
+    if constexpr (is_ssl_stream_v<Upstream>) {
+        return Upstream(net::ip::tcp::socket(s_ref->io_context()),
+                        s_ref->upstream_ssl_ctx());
+    } else {
+        return Upstream(s_ref->io_context());
+    }
+}
+
+template <typename Derived, typename DownStream, typename Upstream = net::ip::tcp::socket>
 class SessionBase : public std::enable_shared_from_this<Derived> {
 protected:
     DownStream m_down;
@@ -48,7 +77,7 @@ protected:
     // @Usage: Second leg. Built closed and opened by async_connect later, because a
     // tcp::socket has no default constructor and the upstream is not known until the
     // request has been read and routed.
-    net::ip::tcp::socket m_up;
+    Upstream m_up;
     beast::flat_buffer m_up_buf;
 
     // @Usage: Held as a member because async_connect iterates it after the completion
@@ -99,9 +128,15 @@ protected:
         // @Usage: Bounds a client that connects and then stalls without sending a
         // request, or trickles headers forever. M2 has no header limit yet.
         self->arm_deadline(self->m_serv_ref->config().get_read_ms());
+        
+        // @Correctness: The size of the incoming request must have an upper bound
+        // or we might receive huge payloads from malicious requests.
+        auto req_parser = std::make_shared<http::request_parser<http::string_body>>();
+        req_parser->body_limit(self->m_serv_ref->config().get_body_bytes());
+        req_parser->header_limit(self->m_serv_ref->config().get_header_bytes());
 
-        http::async_read(m_down, m_buf, self->m_req,
-            [self] (const beast::error_code ec, std::size_t) {
+        http::async_read(m_down, m_buf, *req_parser,
+            [self, req_parser] (const beast::error_code ec, std::size_t) {
 
                 if (ec) {
                     // @Usage: A Content-Length plus Transfer-Encoding conflict is a
@@ -112,6 +147,9 @@ protected:
                         ec == http::error::bad_content_length ||
                         ec == http::error::multiple_content_length;
 
+                    const bool body_size_exceeded = ec == http::error::body_limit; 
+                    const bool header_size_exceeded = ec == http::error::header_limit;
+
                     self->disarm_deadline();
                     std::cerr << "Error parsing the http request (" << ec.message()
                               << "), dropping the connection...\n";
@@ -120,7 +158,9 @@ protected:
                     // the client's version, so 10 is the safest floor to reply with.
                     auto error_response = framing_conflict
                         ? ErrorResponse::make_error_400_framing_conflict(10)
-                        : ErrorResponse::make_error_400(10);
+                        : (body_size_exceeded) ? ErrorResponse::make_error_413(self->m_serv_ref->config().get_body_bytes(), 10) : 
+                        (header_size_exceeded) ? ErrorResponse::make_error_431(req_parser->release().version()) : 
+                        ErrorResponse::make_error_400(10);
 
                     http::async_write(self->m_down, error_response,
                             [self] (const beast::error_code ec, std::size_t) {
@@ -133,9 +173,50 @@ protected:
                     return;
                 }
 
+                self->m_req = req_parser->release();
                 self->connect_upstream();
             }
         );
+    }
+
+    // @Usage: Runs after the upstream TCP connect succeeds. On a TLS leg there is one
+    // more step before the socket can carry HTTP: the TLS handshake, budgeted by
+    // handshake_ms. On a plain leg there is nothing to do, so the whole body is discarded
+    // at compile time and no handshake code is instantiated.
+    void handshake_upstream() {
+        auto self = this->shared_from_this();
+
+        if constexpr (is_ssl_stream_v<Upstream>) {
+            // @Usage: SNI so a name based origin can pick the right certificate. Guarded
+            // because an upstream configured by IP has no name to send.
+            if (!self->m_upstream->host.empty()) {
+                SSL_set_tlsext_host_name(self->m_up.native_handle(),
+                                         self->m_upstream->host.c_str());
+            }
+
+            self->arm_deadline(self->m_serv_ref->config().get_handshake_ms());
+
+            self->m_up.async_handshake(net::ssl::stream_base::client,
+                [self] (const sys::error_code& ec) {
+
+                    if (ec) {
+                        std::cerr << "Upstream TLS handshake failed: " << ec.message() << '\n';
+                        self->disarm_deadline();
+                        self->send_error(ErrorResponse::make_error_502(self->m_req.version()));
+                        return;
+                    }
+
+                    // @Usage: The handshake budget is spent, so the read budget takes over
+                    // for the forward and relay steps, same handoff as after connect.
+                    self->disarm_deadline();
+                    self->arm_deadline(self->m_serv_ref->config().get_read_ms());
+
+                    self->write_upstream();
+                }
+            );
+        } else {
+            self->write_upstream();
+        }
     }
 
     void connect_upstream() {
@@ -174,7 +255,12 @@ protected:
                 // the range overload lives in <boost/asio/connect.hpp>. It takes
                 // results_type by const reference and owns the iteration itself, so
                 // m_endpoints must outlive this call, which is why it is a member.
-                net::async_connect(self->m_up, self->m_endpoints,
+                //
+                // @Correctness: The target is lowest_layer(m_up), not m_up. An ssl::stream is
+                // not a socket, so connecting to it directly does not compile on a TLS leg.
+                // lowest_layer resolves to the socket under the ssl::stream, and to m_up
+                // itself on a plain leg, so one call covers both.
+                net::async_connect(lowest_layer(self->m_up), self->m_endpoints,
                     [self] (const sys::error_code& ec, const net::ip::tcp::endpoint&) {
 
                         if (ec) {
@@ -189,7 +275,7 @@ protected:
                         self->disarm_deadline();
                         self->arm_deadline(self->m_serv_ref->config().get_read_ms());
 
-                        self->write_upstream();
+                        self->handshake_upstream();
                     }
                 );
             }
@@ -252,14 +338,23 @@ protected:
         // @Usage: A HEAD response legitimately has no body, so the parser must be told
         // to stop at the headers. Without skip(true) it waits for body bytes the origin
         // will never send, and the session hangs until the connection times out.
-        // @Usage: A HEAD response legitimately has no body, so the parser must be told
-        // to stop at the headers. Without skip(true) it waits for body bytes the origin
-        // will never send, and the session hangs until the connection times out.
         //
         // @Correctness: The parser is captured by the handler rather than by
         // reference. async_read outlives this scope, so a reference would dangle, and
         // get() must not be called until the read has completed.
         auto parser = std::make_shared<http::response_parser<http::string_body>>();
+
+// @Usage: Bounds the origin leg. The request limit only protects against the
+        // client, and a hostile or broken origin can stream an unbounded response body
+        // into m_up_buf just as easily. Same knob for both directions: one limit to
+        // configure, and a download larger than it is a policy failure, not a bug.
+        //
+        // @Correctness: Never call parser->get() once either of these fires. The message
+        // is incomplete, so get() would read half built fields. The error branch below
+        // returns without touching it.
+        parser->body_limit(self->m_serv_ref->config().get_body_bytes());
+        parser->header_limit(self->m_serv_ref->config().get_header_bytes());
+
         if (self->m_req.method() == http::verb::head) {
             parser->skip(true);
         }
@@ -269,7 +364,23 @@ protected:
 
                 if (ec) {
                     self->disarm_deadline();
-                    std::cerr << "Error reading the upstream response: " << ec.message() << '\n';
+
+                    // @Usage: 502 rather than 413 or 431. The client did nothing wrong
+                    // here; the origin produced a response larger than this proxy will
+                    // relay, so blaming the client would send it off to fix the wrong
+                    // thing. Both limit breaches land on the same factory, but are logged
+                    // separately because they have different fixes on the origin side.
+                    // @Usage: Compared rather than switched because beast::error_code is
+                    // boost::system::error_code, which has no integral conversion to
+                    // switch on.
+                    if (ec == http::error::body_limit) {
+                        std::cerr << "Upstream response body exceeded limits.body_bytes\n";
+                    } else if (ec == http::error::header_limit) {
+                        std::cerr << "Upstream response headers exceeded limits.header_bytes\n";
+                    } else {
+                        std::cerr << "Error reading the upstream response: " << ec.message() << '\n';
+                    }
+
                     self->send_error(ErrorResponse::make_error_502(self->m_req.version()));
                     return;
                 }
@@ -354,11 +465,19 @@ protected:
     }
 
 public:
+    // @Usage: @Preconditions @a s_ref outlives this session. The io_context and the
+    // upstream ssl context are read to build the second leg, so they cannot be passed
+    // in as loose arguments: every call site would have to thread them through.
+    //
+    // @Correctness: The upstream leg is built in the member initialiser list rather than
+    // assigned later. An ssl::stream is not assignable from a tcp::socket, and it has no
+    // default constructor, so a post-construction assignment cannot express "the upstream
+    // is a TLS stream". Choosing the type here is what lets Upstream stay a plain value.
     SessionBase(DownStream&& down, Server* s_ref, beast::flat_buffer buf = {},
                 std::string client_ip = {}, const HostData* upstream = nullptr)
         : m_down(std::move(down)), m_buf(std::move(buf)), m_serv_ref(s_ref),
           m_client_ip(std::move(client_ip)), m_upstream(upstream),
-          m_up(s_ref->io_context()), m_deadline(s_ref->io_context()) {}
+          m_up(make_upstream<Upstream>(s_ref)), m_deadline(s_ref->io_context()) {}
 
     void start() {
         if constexpr (is_ssl_stream_v<DownStream>) {

@@ -1,12 +1,8 @@
 #pragma once
 #include <boost/asio/buffer.hpp>
-#include <boost/asio/io_context.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/beast/version.hpp>
-#include <boost/system/system_error.hpp>
-#include <boost/version.hpp>
-#include <boost/asio/ssl.hpp>
 #include <array>
 #include <unordered_set>
 #include <string_view>

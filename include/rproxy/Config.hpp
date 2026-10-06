@@ -35,8 +35,13 @@ class Config {
 
     std::vector<HostData> upstreams_array;
 
-    std::size_t body_bytes = 8192;
-    std::size_t header_bytes = 8192;
+    // @Usage: Defaults come from the design doc, section 5 step 2: 8 KiB of headers and
+    // 8 MiB of body. header_bytes stays small because a request line plus headers is
+    // normally well under that, whereas body_bytes has to accommodate ordinary uploads.
+    // An 8 KiB body default rejects every non trivial POST with a 413, which reads as a
+    // broken proxy rather than a configured limit.
+    std::size_t body_bytes = 8 * 1024 * 1024;
+    std::size_t header_bytes = 8 * 1024;
 
     std::chrono::milliseconds connect_ms{5000};
     std::chrono::milliseconds handshake_ms{8000};

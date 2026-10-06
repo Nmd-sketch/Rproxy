@@ -47,30 +47,82 @@ struct TCPListener {
     }
 };
 
+// @Usage: Server side TLS context for the TLS origin. Reuses the proxy's own cert
+// pair, which is sound only because Server::m_up_ssl_ctx is verify_none today. Once
+// upstream verification is wired up this origin needs a CA the proxy trusts.
+net::ssl::context make_origin_tls_context() {
+    const std::filesystem::path certs = RPROXY_TLS_CERT_DIR;
+
+    // @Usage: .string() rather than .c_str() because Asio takes a const char* and
+    // path::value_type is wchar_t under MinGW, so a raw pointer would not narrow.
+    net::ssl::context ctx{net::ssl::context::tlsv12_server};
+    ctx.use_certificate_chain_file((certs / "cert.pem").string().c_str());
+    ctx.use_private_key_file((certs / "key.pem").string().c_str(),
+                             net::ssl::context::pem);
+    return ctx;
+}
+
+// @Usage: The two ways an origin can wrap an accepted socket. Templating on the leg
+// rather than the stream type keeps the accept / record / reply loop in one place,
+// so PlainOrigin and TlsOrigin cannot drift apart.
+struct PlainLeg {
+    using stream_type = net::ip::tcp::socket;
+
+    static stream_type wrap(net::ip::tcp::socket sock, net::ssl::context&) {
+        return sock;
+    }
+
+    // Nothing to set up: a plain socket is ready for HTTP immediately.
+    static bool prepare(stream_type&) noexcept { return true; }
+};
+
+struct TlsLeg {
+    using stream_type = net::ssl::stream<net::ip::tcp::socket>;
+
+    static stream_type wrap(net::ip::tcp::socket sock, net::ssl::context& ctx) {
+        return stream_type(std::move(sock), ctx);
+    }
+
+    // @Correctness: The handshake is driven explicitly here. Asynchronous ssl::stream
+    // operations start it themselves, which is why SessionBase can rely on
+    // async_handshake, but the synchronous read below is just a read as far as the engine
+    // is concerned. Skipping this fails the first read with SSL_R_UNINITIALIZED and the
+    // peer sees a connection reset.
+    static bool prepare(stream_type& stream) noexcept {
+        sys::error_code ec;
+        stream.handshake(net::ssl::stream_base::server, ec);
+        return !ec;
+    }
+};
+
 // A looping origin that replies with a fixed body and records the last request it saw.
 //
 // The listener is owned by a shared_ptr and closed in the destructor, which makes the
 // serving thread's accept() fail and return. Detaching it instead would leave the
-// thread writing to m_observed and touching m_acceptor after those were destroyed.
-class StubOrigin {
+// thread writing to m_observed and touching the acceptor after those were destroyed.
+template <typename Leg>
+class StubOriginT {
 public:
-    explicit StubOrigin(std::string body)
+    using stream_type = typename Leg::stream_type;
+
+    explicit StubOriginT(std::string body)
         : m_body(std::move(body)),
+          m_ctx(make_origin_tls_context()),
           m_listener(std::make_shared<TCPListener>()) {
 
         m_port = m_listener->port();
         m_thread = std::thread([this, listener = m_listener] { serve(*listener); });
     }
 
-    ~StubOrigin() {
+    ~StubOriginT() {
         m_listener->close();
         if (m_thread.joinable()) {
             m_thread.join();
         }
     }
 
-    StubOrigin(const StubOrigin&) = delete;
-    StubOrigin& operator=(const StubOrigin&) = delete;
+    StubOriginT(const StubOriginT&) = delete;
+    StubOriginT& operator=(const StubOriginT&) = delete;
 
     std::uint16_t port() const { return m_port; }
 
@@ -91,9 +143,21 @@ private:
                 return;
             }
 
+            stream_type stream = Leg::wrap(std::move(sock), m_ctx);
+
+            if (!Leg::prepare(stream)) {
+                // A TLS origin handed plaintext by a proxy that believes this leg is TLS
+                // fails here. Loop back to accept rather than throwing out of the serving
+                // thread and taking the process down.
+                continue;
+            }
+
             beast::flat_buffer buffer;
             http::request<http::string_body> req;
-            http::read(sock, buffer, req, ec);
+            http::read(stream, buffer, req, ec);
+            if (ec) {
+                continue;
+            }
 
             std::string wire;
             wire += std::string(req.method_string()) + " " + std::string(req.target()) + "\r\n";
@@ -111,18 +175,21 @@ private:
             resp.set(http::field::content_type, "text/plain");
             resp.body() = m_body;
             resp.prepare_payload();
-            http::write(sock, resp, ec);
-            sock.close(ec);
+            http::write(stream, resp, ec);
         }
     }
 
     std::shared_ptr<TCPListener> m_listener;
     std::uint16_t m_port{0};
     std::string m_body;
+    net::ssl::context m_ctx;
     mutable std::mutex m_mutex;
     std::string m_observed;
     std::thread m_thread;
 };
+
+using StubOrigin = StubOriginT<PlainLeg>;
+using TlsOrigin = StubOriginT<TlsLeg>;
 
 std::filesystem::path make_workspace(const std::string& name) {
     const auto dir = std::filesystem::temp_directory_path() / ("rproxy_" + name);
@@ -151,7 +218,8 @@ void write_file(const std::filesystem::path& p, const std::string& contents) {
 }
 
 std::string make_config(std::uint16_t port, const std::string& upstream_block,
-                        int read_ms = 30000) {
+                        int read_ms = 30000, std::size_t body_bytes = 8388608,
+                        std::size_t header_bytes = 8192) {
     return "[server]\n"
            "port = " + std::to_string(port) + "\n"
            "threads = 1\n\n"
@@ -160,8 +228,8 @@ std::string make_config(std::uint16_t port, const std::string& upstream_block,
            "key  = \"key.pem\"\n\n" +
            upstream_block +
            "[limits]\n"
-           "header_bytes = 8192\n"
-           "body_bytes   = 8388608\n\n"
+           "header_bytes = " + std::to_string(header_bytes) + "\n"
+           "body_bytes   = " + std::to_string(body_bytes) + "\n\n"
            "[timeouts]\n"
            "connect_ms = 5000\n"
            "handshake_ms = 5000\n"
@@ -179,9 +247,11 @@ void serve_forever(Server* server) {
     server->start();
 }
 
-std::string upstream_block_for(std::uint16_t origin_port) {
+// @Usage: The tls flag here is what selects the upstream leg type at accept time, so it
+// is what routes a request to PlainSession versus PlainToTlsSession.
+std::string upstream_block_for(std::uint16_t origin_port, bool tls = false) {
     return "[[upstream]]\nname = \"stub\"\nhost = \"127.0.0.1\"\nport = " +
-           std::to_string(origin_port) + "\ntls = false\n\n";
+           std::to_string(origin_port) + "\ntls = " + (tls ? "true" : "false") + "\n\n";
 }
 
 // A running proxy, restored on destruction.
@@ -192,12 +262,14 @@ std::string upstream_block_for(std::uint16_t origin_port) {
 // Proxy cases in one process leaves the last workspace in place for the next one.
 class RunningProxy {
 public:
-    RunningProxy(std::string workspace, std::string upstream_block, int read_ms = 30000) {
+    RunningProxy(std::string workspace, std::string upstream_block, int read_ms = 30000,
+                 std::size_t body_bytes = 8388608, std::size_t header_bytes = 8192) {
         const auto dir = make_workspace(workspace);
         copy_certs(dir);
 
         const auto proxy_port = free_port();
-        write_file(dir / "config.toml", make_config(proxy_port, upstream_block, read_ms));
+        write_file(dir / "config.toml",
+                   make_config(proxy_port, upstream_block, read_ms, body_bytes, header_bytes));
 
         m_previous_cwd = std::filesystem::current_path();
         std::filesystem::current_path(dir);
@@ -248,6 +320,33 @@ http::response<http::string_body> get_through_proxy(std::uint16_t proxy_port) {
     http::request<http::string_body> req{http::verb::get, "/", 11};
     req.set(http::field::host, "example.com");
     return send_through_proxy(proxy_port, req);
+}
+
+// @Usage: Client leg variant, so a test can drive TlsToPlainSession or TlsToTlsSession.
+// @Correctness: verify_none rather than a trust store, because the proxy presents the
+// throwaway test certificate. This asserts that a TLS client leg is classified as TLS,
+// not that the certificate is trusted.
+http::response<http::string_body> get_through_proxy_tls(std::uint16_t proxy_port) {
+    net::io_context ioc;
+    net::ssl::context client_ctx{net::ssl::context::tlsv12_client};
+    client_ctx.set_verify_mode(net::ssl::verify_none);
+
+    net::ip::tcp::resolver res(ioc);
+    auto endpoints = res.resolve("127.0.0.1", std::to_string(proxy_port));
+
+    net::ssl::stream<net::ip::tcp::socket> sock{ioc, client_ctx};
+    sock.next_layer().connect(*endpoints.begin());
+    sock.handshake(net::ssl::stream_base::client);
+
+    http::request<http::string_body> req{http::verb::get, "/", 11};
+    req.set(http::field::host, "example.com");
+
+    beast::flat_buffer buffer;
+    http::write(sock, req);
+
+    http::response<http::string_body> resp;
+    http::read(sock, buffer, resp);
+    return resp;
 }
 
 // Reads a header value from a captured raw request, matching the field name exactly.
@@ -551,25 +650,209 @@ TEST(Proxy, RoutesOverTls)
     StubOrigin origin("ORIGIN-TLS");
     const RunningProxy proxy("tls", upstream_block_for(origin.port()));
 
-    net::io_context ioc;
-    net::ssl::context client_ctx{net::ssl::context::tlsv12_client};
-    client_ctx.set_verify_mode(net::ssl::verify_none);
-
-    net::ip::tcp::resolver res(ioc);
-    auto endpoints = res.resolve("127.0.0.1", std::to_string(proxy.port()));
-
-    net::ssl::stream<net::ip::tcp::socket> sock{ioc, client_ctx};
-    sock.next_layer().connect(*endpoints.begin());
-    sock.handshake(net::ssl::stream_base::client);
-
-    beast::flat_buffer buffer;
-    http::request<http::string_body> req{http::verb::get, "/", 11};
-    req.set(http::field::host, "example.com");
-    http::write(sock, req);
-
-    http::response<http::string_body> resp;
-    http::read(sock, buffer, resp);
+    const auto resp = get_through_proxy_tls(proxy.port());
 
     EXPECT_EQ(resp.result_int(), 200);
     EXPECT_EQ(resp.body(), "ORIGIN-TLS");
+}
+
+// Covers PlainToTlsSession: a plain client leg reaching a TLS origin.
+//
+// This is the case the 2x2 dispatch has to get right on the upstream side, and it is
+// what proves tls = true actually changes the upstream leg type rather than being
+// parsed and ignored.
+TEST(Proxy, ForwardsToATlsUpstreamFromAPlainClient)
+{
+    TlsOrigin origin("ORIGIN-TLS-UPSTREAM");
+    const RunningProxy proxy("uptls", upstream_block_for(origin.port(), true));
+
+    const auto resp = get_through_proxy(proxy.port());
+
+    EXPECT_EQ(resp.result_int(), 200);
+    EXPECT_EQ(resp.body(), "ORIGIN-TLS-UPSTREAM");
+
+    // @Usage: The proto header is derived from the client leg, so it stays http here
+    // even though the origin leg was TLS. Worth pinning so a future change does not
+    // report the upstream leg's scheme by mistake.
+    const auto proto = header_in(origin.observed_request(), "X-Forwarded-Proto");
+    ASSERT_TRUE(proto.has_value()) << origin.observed_request();
+    EXPECT_EQ(*proto, " http");
+}
+
+// Covers TlsToTlsSession: TLS on both legs, the only cell with two handshakes in the
+// request path.
+TEST(Proxy, ForwardsToATlsUpstreamFromATlsClient)
+{
+    TlsOrigin origin("ORIGIN-TLS-BOTH");
+    const RunningProxy proxy("uptlsboth", upstream_block_for(origin.port(), true));
+
+    const auto resp = get_through_proxy_tls(proxy.port());
+
+    EXPECT_EQ(resp.result_int(), 200);
+    EXPECT_EQ(resp.body(), "ORIGIN-TLS-BOTH");
+
+    // Opposite of the plain client case: now the client leg was TLS.
+    const auto proto = header_in(origin.observed_request(), "X-Forwarded-Proto");
+    ASSERT_TRUE(proto.has_value()) << origin.observed_request();
+    EXPECT_EQ(*proto, " https");
+}
+
+// The mirror of the above: a TLS client to a plain origin, which is what
+// TlsToPlainSession exists for.
+TEST(Proxy, ForwardsToAPlainUpstreamFromATlsClient)
+{
+    StubOrigin origin("ORIGIN-PLAIN-UPSTREAM");
+    const RunningProxy proxy("tlsplain", upstream_block_for(origin.port()));
+
+    const auto resp = get_through_proxy_tls(proxy.port());
+
+    EXPECT_EQ(resp.result_int(), 200);
+    EXPECT_EQ(resp.body(), "ORIGIN-PLAIN-UPSTREAM");
+
+    const auto proto = header_in(origin.observed_request(), "X-Forwarded-Proto");
+    ASSERT_TRUE(proto.has_value()) << origin.observed_request();
+    EXPECT_EQ(*proto, " https");
+}
+
+// @Usage: A tls = true upstream that turns out not to speak TLS has to surface as 502,
+// not as a hung connection or a process kill. This is the negative case for the
+// upstream handshake: the proxy completes a TCP connect, sends a ClientHello, and the
+// origin replies with plaintext HTTP instead.
+TEST(Proxy, Returns502WhenATlsUpstreamSpeaksPlainHttp)
+{
+    StubOrigin origin("SHOULD-NEVER-BE-RELAYED");
+    const RunningProxy proxy("tlsplainfail", upstream_block_for(origin.port(), true));
+
+    const auto resp = get_through_proxy(proxy.port());
+
+    EXPECT_EQ(resp.result_int(), 502);
+
+    // @Correctness: The origin must not have been reached with a readable request. If the
+    // proxy forwarded the request before handshaking, this body would come back as a 200.
+    EXPECT_TRUE(origin.observed_request().empty()) << origin.observed_request();
+}
+
+// The response side needs its own cap. limits.body_bytes alone protected the request
+// leg, but a hostile or broken origin can stream an unbounded body into m_up_buf just
+// as easily, and nothing stopped that.
+TEST(Proxy, Returns502WhenTheOriginResponseExceedsTheBodyLimit)
+{
+    StubOrigin origin("THIS-RESPONSE-BODY-IS-WAY-TOO-LONG");
+    const RunningProxy proxy("respbig", upstream_block_for(origin.port()),
+                             30000, /*body_bytes=*/16);
+
+    const auto resp = get_through_proxy(proxy.port());
+
+    EXPECT_EQ(resp.result_int(), 502);
+
+    // @Correctness: Nothing may reach the client. A partial body already streamed
+    // before the limit tripped would leave the client with a truncated response wearing
+    // a 502's status, which is worse than an honest failure.
+    EXPECT_TRUE(resp.body().find("THIS-RESPONSE-BODY") == std::string::npos) << resp.body();
+}
+
+// Counterweight to the above. Without a test on the passing side, a limit wired one byte
+// too tight would look identical to the limit working.
+TEST(Proxy, RelaysAResponseThatFitsUnderTheBodyLimit)
+{
+    StubOrigin origin("ORIGIN-BODY-X");
+    const RunningProxy proxy("respok", upstream_block_for(origin.port()),
+                             30000, /*body_bytes=*/64);
+
+    const auto resp = get_through_proxy(proxy.port());
+
+    EXPECT_EQ(resp.result_int(), 200);
+    EXPECT_EQ(resp.body(), "ORIGIN-BODY-X");
+}
+
+// Covers the request side of the same limit. The wiring existed before any test did,
+// so nothing pinned it: a body_limit that was never applied, or applied to the wrong
+// leg, would have passed the whole suite.
+TEST(Proxy, Returns413WhenTheRequestBodyExceedsTheBodyLimit)
+{
+    StubOrigin origin("SHOULD-NEVER-BE-RELAYED");
+    const RunningProxy proxy("reqbig", upstream_block_for(origin.port()),
+                             30000, /*body_bytes=*/16);
+
+    http::request<http::string_body> req{http::verb::post, "/upload", 11};
+    req.set(http::field::host, "example.com");
+    req.body() = "THIS-REQUEST-BODY-IS-WAY-TOO-LONG";
+    req.prepare_payload();
+
+    const auto resp = send_through_proxy(proxy.port(), req);
+
+    EXPECT_EQ(resp.result_int(), 413);
+
+    // @Correctness: The limit has to stop the request before it is forwarded. Reaching
+    // the origin first would mean the body was already uploaded over the wire, which is
+    // exactly the cost the limit exists to avoid.
+    EXPECT_TRUE(origin.observed_request().empty()) << origin.observed_request();
+}
+
+// Covers the request side header cap, which like body_bytes had no test pinning it.
+TEST(Proxy, Returns431WhenTheRequestHeadersExceedTheHeaderLimit)
+{
+    StubOrigin origin("SHOULD-NEVER-BE-RELAYED");
+    const RunningProxy proxy("reqhdr", upstream_block_for(origin.port()),
+                             30000, /*body_bytes=*/8388608, /*header_bytes=*/256);
+
+    http::request<http::string_body> req{http::verb::get, "/", 11};
+    req.set(http::field::host, "example.com");
+    // One field large enough to push the header block past the configured 256 bytes.
+    req.set("X-Filler", std::string(400, 'a'));
+
+    const auto resp = send_through_proxy(proxy.port(), req);
+
+    EXPECT_EQ(resp.result_int(), 431);
+    EXPECT_TRUE(origin.observed_request().empty()) << origin.observed_request();
+}
+
+// The response header block needs a cap too. An origin can send an unbounded header
+// section for exactly the same reason it can send an unbounded body, and the request
+// side limit does not cover it.
+TEST(Proxy, Returns502WhenTheOriginResponseHeadersExceedTheHeaderLimit)
+{
+    // @Usage: The origin replies with a header far wider than the proxy's own header
+    // limit allows, which is the realistic version of this: a proxy that accepts small
+    // headers from a client must not accept unlimited ones from an origin.
+    const std::uint16_t origin_port = [] {
+        auto listener = std::make_shared<TCPListener>();
+        const auto port = listener->port();
+
+        std::thread([listener] {
+            for (;;) {
+                net::ip::tcp::socket sock{listener->ctx};
+                sys::error_code ec;
+                listener->acceptor.accept(sock, ec);
+                if (ec) {
+                    return;
+                }
+
+                beast::flat_buffer buffer;
+                http::request<http::string_body> req;
+                http::read(sock, buffer, req, ec);
+                if (ec) {
+                    continue;
+                }
+
+                std::string reply =
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                    "X-Wide: " + std::string(4000, 'b') + "\r\n\r\nBODY";
+                net::write(sock, net::buffer(reply), ec);
+            }
+        }).detach();
+
+        // @Correctness: The listener is heap owned and shared into the thread, because a
+        // stack acceptor would dangle once this lambda returns.
+        (void)listener;
+        return port;
+    }();
+
+    const RunningProxy proxy("resphdr", upstream_block_for(origin_port),
+                             30000, /*body_bytes=*/8388608, /*header_bytes=*/256);
+
+    const auto resp = get_through_proxy(proxy.port());
+
+    EXPECT_EQ(resp.result_int(), 502);
+    EXPECT_TRUE(resp.body().find("BODY") == std::string::npos) << resp.body();
 }

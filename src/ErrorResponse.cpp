@@ -3,7 +3,7 @@
 #include <cstdio>
 #include <string>
 
-namespace {
+namespace ErrorResponse::detail {
 
     std::string json_escape(std::string_view in) {
         std::string out;
@@ -33,6 +33,10 @@ namespace {
         return out;
     }
 
+}  // namespace ErrorResponse::detail
+
+namespace {
+
     http::response<http::string_body> make_json(http::status status, std::string_view slug,
                                                 std::string_view message, unsigned version) {
         http::response<http::string_body> resp;
@@ -41,8 +45,8 @@ namespace {
         resp.version(version);
         resp.set(http::field::content_type, "application/json");
         resp.keep_alive(false);
-        resp.body() = std::string("{\"error\": \"") + json_escape(slug) +
-                      "\", \"message\": \"" + json_escape(message) + "\"}";
+        resp.body() = std::string("{\"error\": \"") + ErrorResponse::detail::json_escape(slug) +
+                      "\", \"message\": \"" + ErrorResponse::detail::json_escape(message) + "\"}";
         resp.prepare_payload();
 
         return resp;
@@ -71,12 +75,10 @@ http::response<http::string_body> ErrorResponse::make_error_413(
                      version);
 }
 
-http::response<http::string_body> ErrorResponse::make_error_431(
-    std::string_view header_name, unsigned version) {
+http::response<http::string_body> ErrorResponse::make_error_431(unsigned version) {
     return make_json(http::status::request_header_fields_too_large,
                      "request_header_fields_too_large",
-                     "The request header field '" + std::string(header_name) +
-                         "' exceeded the maximum allowed size.",
+                     "The request header fields exceeded the maximum allowed size.",
                      version);
 }
 

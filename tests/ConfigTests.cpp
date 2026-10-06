@@ -89,6 +89,11 @@ read_ms = 7000
     EXPECT_EQ(config.get_read_ms(), std::chrono::milliseconds(7000));
 }
 
+// @Usage: These are the values an operator gets by writing no [limits] section at all,
+// so they are part of the contract, not incidental. 8 KiB of headers and 8 MiB of body
+// come from the design doc, section 5 step 2. The body default in particular has to be
+// generous: an 8 KiB cap rejects every non trivial POST with a 413, and the operator who
+// hits that has no [limits] block to go looking at.
 TEST(Config, EmptyDocumentYieldsDocumentedDefaults)
 {
     const Config config(parse_ok(""));
@@ -98,8 +103,8 @@ TEST(Config, EmptyDocumentYieldsDocumentedDefaults)
     EXPECT_EQ(config.get_certificate_path(), "certificates/cert.pem");
     EXPECT_EQ(config.get_key_path(), "certificates/key.pem");
     EXPECT_TRUE(config.get_upstreams().empty());
-    EXPECT_EQ(config.get_header_bytes(), 8192u);
-    EXPECT_EQ(config.get_body_bytes(), 8192u);
+    EXPECT_EQ(config.get_header_bytes(), 8u * 1024);
+    EXPECT_EQ(config.get_body_bytes(), 8u * 1024 * 1024);
     EXPECT_EQ(config.get_connect_ms(), std::chrono::milliseconds(5000));
     EXPECT_EQ(config.get_handshake_ms(), std::chrono::milliseconds(8000));
     EXPECT_EQ(config.get_read_ms(), std::chrono::milliseconds(30000));

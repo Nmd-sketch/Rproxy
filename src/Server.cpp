@@ -33,14 +33,33 @@ void Server::accept() {
 
                             const HostData* upstream = this->load_balancer().next();
 
-                            if (result) {
-                                std::make_shared<TlsSession>(net::ssl::stream<net::ip::tcp::socket>(std::move(*socket),
-                                            this->m_ssl_ctx), this, std::move(*buf),
-                                            std::move(client_ip), upstream)->start();
+                            // @Correctness: next() returns nullptr when no upstream is
+                            // configured. The session has to exist anyway so it can answer
+                            // 503, so the TLS flag is read defensively rather than
+                            // dereferencing a null upstream and crashing the accept loop.
+                            const bool up_tls = upstream != nullptr && upstream->uses_tls;
+
+                            // @Usage: The 2x2 matrix of (client leg, upstream leg). Plain is
+                            // the fallback when there is no upstream, because that leg is
+                            // never connected to and the session replies 503 instead.
+                            if (result && up_tls) {
+                                std::make_shared<TlsToTlsSession>(
+                                        net::ssl::stream<net::ip::tcp::socket>(std::move(*socket),
+                                                this->m_ssl_ctx), this, std::move(*buf),
+                                                std::move(client_ip), upstream)->start();
+                            } else if (result) {
+                                std::make_shared<TlsToPlainSession>(
+                                        net::ssl::stream<net::ip::tcp::socket>(std::move(*socket),
+                                                this->m_ssl_ctx), this, std::move(*buf),
+                                                std::move(client_ip), upstream)->start();
+                            } else if (up_tls) {
+                                std::make_shared<PlainToTlsSession>(std::move(*socket), this,
+                                                std::move(*buf), std::move(client_ip),
+                                                upstream)->start();
                             } else {
                                 std::make_shared<PlainSession>(std::move(*socket), this,
-                                            std::move(*buf), std::move(client_ip),
-                                            upstream)->start();
+                                                std::move(*buf), std::move(client_ip),
+                                                upstream)->start();
                             }
 
                         }

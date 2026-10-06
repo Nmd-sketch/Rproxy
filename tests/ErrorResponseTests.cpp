@@ -36,7 +36,7 @@ TEST(ErrorResponse, EveryFactorySetsTheDocumentedStatusCode)
     EXPECT_EQ(ErrorResponse::make_error_400(11).result_int(), 400);
     EXPECT_EQ(ErrorResponse::make_error_400_framing_conflict(11).result_int(), 400);
     EXPECT_EQ(ErrorResponse::make_error_413(1024, 11).result_int(), 413);
-    EXPECT_EQ(ErrorResponse::make_error_431("X-Long", 11).result_int(), 431);
+    EXPECT_EQ(ErrorResponse::make_error_431(11).result_int(), 431);
     EXPECT_EQ(ErrorResponse::make_error_500(11).result_int(), 500);
     EXPECT_EQ(ErrorResponse::make_error_502(11).result_int(), 502);
     EXPECT_EQ(ErrorResponse::make_error_503(11).result_int(), 503);
@@ -58,7 +58,7 @@ TEST(ErrorResponse, BodyIsWellFormedJsonForEveryFactory)
         ErrorResponse::make_error_400(11).body(),
         ErrorResponse::make_error_400_framing_conflict(11).body(),
         ErrorResponse::make_error_413(4096, 11).body(),
-        ErrorResponse::make_error_431("X-Long", 11).body(),
+        ErrorResponse::make_error_431(11).body(),
         ErrorResponse::make_error_500(11).body(),
         ErrorResponse::make_error_502(11).body(),
         ErrorResponse::make_error_503(11).body(),
@@ -128,20 +128,46 @@ TEST(ErrorResponse, ErrorSlugsAreDistinctPerCondition)
     EXPECT_NE(ErrorResponse::make_error_503(11).body(), ErrorResponse::make_error_504(11).body());
 }
 
-TEST(ErrorResponse, HostileHeaderNameCannotBreakOutOfTheJsonString)
+TEST(ErrorResponse, QuotesAndBackslashesAreEscapedSoTextCannotBreakOutOfTheString)
 {
-    const auto resp = ErrorResponse::make_error_431("X-Bad\"name", 11);
+    EXPECT_EQ(ErrorResponse::detail::json_escape("X-Bad\"name"), "X-Bad\\\"name");
+    EXPECT_EQ(ErrorResponse::detail::json_escape("X\\Bad"), "X\\\\Bad");
 
-    EXPECT_NE(resp.body().find("X-Bad\\\""), std::string::npos) << resp.body();
-    EXPECT_EQ(unescaped_quote_count(resp.body()), 8u)
-        << "four quotes per key/value pair across two pairs: " << resp.body();
+    // A backslash immediately before a quote is the case that breaks naive escapers:
+    // the backslash must be doubled first or the quote escapes it and terminates the
+    // string.
+    EXPECT_EQ(ErrorResponse::detail::json_escape("a\\\"b"), "a\\\\\\\"b");
 }
 
-TEST(ErrorResponse, BackslashAndControlCharactersAreEscaped)
+TEST(ErrorResponse, ControlCharactersAreEscapedRatherThanPassedThrough)
 {
-    const std::string control{"X\tTab", 5};
+    EXPECT_EQ(ErrorResponse::detail::json_escape("X\tTab"), "X\\tTab");
+    EXPECT_EQ(ErrorResponse::detail::json_escape("X\nNew"), "X\\nNew");
+    EXPECT_EQ(ErrorResponse::detail::json_escape("X\rReturn"), "X\\rReturn");
 
-    EXPECT_NE(ErrorResponse::make_error_431("X\\Bad", 11).body().find("\\\\"),
-              std::string::npos);
-    EXPECT_NE(ErrorResponse::make_error_431(control, 11).body().find("\\t"), std::string::npos);
+    // Remaining C0 controls have no short escape, so they become \uXXXX.
+    EXPECT_EQ(ErrorResponse::detail::json_escape(std::string_view("X\x01", 2)), "X\\u0001");
+
+    // Printable ASCII and UTF-8 pass through untouched, so escaping does not mangle
+    // ordinary text.
+    EXPECT_EQ(ErrorResponse::detail::json_escape("plain-text_123"), "plain-text_123");
+}
+
+TEST(ErrorResponse, EveryFactoryBodyIsSingleLineSoItStaysValidJson)
+{
+    for (const std::string& body : {
+             ErrorResponse::make_error_400(11).body(),
+             ErrorResponse::make_error_400_framing_conflict(11).body(),
+             ErrorResponse::make_error_413(4096, 11).body(),
+             ErrorResponse::make_error_431(11).body(),
+             ErrorResponse::make_error_500(11).body(),
+             ErrorResponse::make_error_502(11).body(),
+             ErrorResponse::make_error_503(11).body(),
+             ErrorResponse::make_error_504(11).body(),
+         }) {
+        EXPECT_EQ(body.find('\n'), std::string::npos) << body;
+        EXPECT_EQ(body.find('\r'), std::string::npos) << body;
+        EXPECT_EQ(unescaped_quote_count(body), 8u)
+            << "four quotes per key/value pair across two pairs: " << body;
+    }
 }
