@@ -5,12 +5,20 @@
 #include <iostream>
 
 void Server::accept() {
+	// @Correctness: Refuse to issue a new async_accept once shutdown has begun. Issuing
+	// one against a closed acceptor fails immediately with bad_descriptor rather than
+	// cancelling, so it would re-arm itself forever and spin a core during teardown.
+	if (m_stopping.load(std::memory_order_relaxed)) {
+		return;
+	}
+
+
 	m_acceptor.async_accept([this](const sys::error_code& ec, net::ip::tcp::socket client) {
-            
+
             auto buf = std::make_shared<beast::flat_buffer>();
             auto socket = std::make_shared<net::ip::tcp::socket>(std::move(client));
 
-			if (!ec) {
+		if (!ec) {
                 // @Usage: Captured here because this is the last point where the raw
                 // socket exists. Once wrapped in an ssl_stream the IP would need
                 // next_layer() on one type and the socket itself on the other.
@@ -25,6 +33,7 @@ void Server::accept() {
 
                 beast::async_detect_ssl(*socket, *buf,
                         [this, socket, buf, client_ip] (const beast::error_code ec, bool result) mutable {
+
 
                             if (ec) {
                                 std::cerr << "SSL detection error\n";
@@ -69,7 +78,14 @@ void Server::accept() {
 				std::cerr << "Error accepting client: " << ec.what() << '\n';
 			}
 
-			this->accept();
+			// @Correctness: Re-arm only while the server is still running. The flag is
+			// checked rather than the error code, because a closed acceptor reports
+			// operation_aborted to the pending operation but bad_descriptor to a new one,
+			// and only the flag rules out both.
+			if (!m_stopping.load(std::memory_order_relaxed)) {
+				this->accept();
+			} else {
+			}
 		}
 	);
 }

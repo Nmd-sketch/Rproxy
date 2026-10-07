@@ -7,6 +7,7 @@
 #include <utility>
 #include <iostream>
 #include <boost/asio/buffer.hpp>
+#include <boost/asio/ip/address.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/connect.hpp>
 #include <boost/asio/ip/tcp.hpp>
@@ -70,21 +71,34 @@ protected:
     beast::flat_buffer m_buf;
     http::request<http::string_body> m_req;
     http::response<http::string_body> m_resp;
+
+    // @Correctness: Error responses are owned HERE rather than built as a local and
+    // handed to async_write. Beast's serializer keeps a reference to the message for the
+    // whole operation, so a local or a by-value parameter is already destroyed by the time
+    // the write runs. The read then serializes freed memory: a garbage Content-Length or
+    // chunk framing makes Beast's serializer spin forever inside consume(), which wedges
+    // the io_context thread so Server::start never returns and the harness join hangs, or
+    // faults outright when the garbage happens to look like a pointer.
+    //
+    // Storing it in the session makes it outlive the write, because every write here
+    // captures self in its handler and the session cannot be destroyed before its own
+    // handler runs. One member is enough: a session only ever sends one error response.
+    http::response<http::string_body> m_err;
     Server* m_serv_ref;
     std::string m_client_ip;
     const HostData* m_upstream;
 
-    // @Usage: Second leg. Built closed and opened by async_connect later, because a
+    // @Note: Second leg. Built closed and opened by async_connect later, because a
     // tcp::socket has no default constructor and the upstream is not known until the
     // request has been read and routed.
     Upstream m_up;
     beast::flat_buffer m_up_buf;
 
-    // @Usage: Held as a member because async_connect iterates it after the completion
+    // @Note: Held as a member because async_connect iterates it after the completion
     // handler returns. A local in the handler would dangle.
     net::ip::tcp::resolver::results_type m_endpoints;
 
-    // @Usage: Beast's steady_timer, used as a deadline. A step times out rather than
+    // @Correctness: Beast's steady_timer, used as a deadline. A step times out rather than
     // hanging forever, because an unbounded wait is a denial of service that any peer
     // can trigger: a slowloris client on the client leg, a silent origin on the
     // upstream leg.
@@ -94,6 +108,7 @@ protected:
         m_deadline.expires_after(budget);
         m_deadline.async_wait(
             [self = this->shared_from_this()] (const beast::error_code ec) {
+
 
                 if (ec == net::error::operation_aborted) {
                     return;
@@ -110,7 +125,7 @@ protected:
                 // later, writing a second response after this 504. No test reaches it:
                 // a silent origin closes once the deadline passes, so the second write
                 // just fails. Closing the in flight operation on timeout needs session
-                // lifecycle changes that arrive with M7.
+                // lifecycle changes.
                 self->m_deadline.cancel();
                 std::cerr << "Upstream step timed out\n";
                 self->send_error(ErrorResponse::make_error_504(self->m_req.version()));
@@ -125,12 +140,14 @@ protected:
     void read_request() {
         auto self = this->shared_from_this();
 
-        // @Usage: Bounds a client that connects and then stalls without sending a
-        // request, or trickles headers forever. M2 has no header limit yet.
+
+        // @Note: Bounds a client that connects and then stalls without sending a
+        // request, or trickles headers forever.
         self->arm_deadline(self->m_serv_ref->config().get_read_ms());
         
         // @Correctness: The size of the incoming request must have an upper bound
-        // or we might receive huge payloads from malicious requests.
+        // or we might receive huge payloads from malicious requests. We guard against
+        // that by setting up body and header size limits
         auto req_parser = std::make_shared<http::request_parser<http::string_body>>();
         req_parser->body_limit(self->m_serv_ref->config().get_body_bytes());
         req_parser->header_limit(self->m_serv_ref->config().get_header_bytes());
@@ -138,8 +155,9 @@ protected:
         http::async_read(m_down, m_buf, *req_parser,
             [self, req_parser] (const beast::error_code ec, std::size_t) {
 
+
                 if (ec) {
-                    // @Usage: A Content-Length plus Transfer-Encoding conflict is a
+                    // @Correctness: A Content-Length plus Transfer-Encoding conflict is a
                     // smuggling attempt, so it is reported distinctly from an ordinary
                     // malformed request. Beast rejects both orders before we get here.
                     const bool framing_conflict =
@@ -154,15 +172,24 @@ protected:
                     std::cerr << "Error parsing the http request (" << ec.message()
                               << "), dropping the connection...\n";
 
-                    // @Correctness: The request may not have parsed far enough to know
-                    // the client's version, so 10 is the safest floor to reply with.
-                    auto error_response = framing_conflict
+                    // @Correctness: The request may not have parsed far enough to know the client's
+                    // version, so 10 is the safest floor to reply with.
+                    //
+                    // Written to m_err, a session member, because async_write's
+                    // serializer holds a reference to the message for the whole operation.
+                    // See m_err for exactly what handing it a local costs.
+                    self->m_err = framing_conflict
                         ? ErrorResponse::make_error_400_framing_conflict(10)
-                        : (body_size_exceeded) ? ErrorResponse::make_error_413(self->m_serv_ref->config().get_body_bytes(), 10) : 
-                        (header_size_exceeded) ? ErrorResponse::make_error_431(req_parser->release().version()) : 
+                        : (body_size_exceeded) ? 
+                        ErrorResponse::make_error_413(self->m_serv_ref->config().get_body_bytes(), 10) : 
+                        (header_size_exceeded) ? 
+                        ErrorResponse::make_error_431(req_parser->release().version()) : 
                         ErrorResponse::make_error_400(10);
 
-                    http::async_write(self->m_down, error_response,
+                    //@Note: If we get an error sending the error response to the client there is nothing
+                    //else we can do, just drop the connection entirely
+
+                    http::async_write(self->m_down, self->m_err,
                             [self] (const beast::error_code ec, std::size_t) {
 
                             if (ec) {
@@ -187,11 +214,39 @@ protected:
         auto self = this->shared_from_this();
 
         if constexpr (is_ssl_stream_v<Upstream>) {
-            // @Usage: SNI so a name based origin can pick the right certificate. Guarded
-            // because an upstream configured by IP has no name to send.
-            if (!self->m_upstream->host.empty()) {
-                SSL_set_tlsext_host_name(self->m_up.native_handle(),
-                                         self->m_upstream->host.c_str());
+            const std::string& tls_name = self->m_upstream->tls_name();
+
+            // @Usage: SNI so a name based origin can pick the right certificate.
+            //
+            // @Correctness: Skipped for an IP literal. RFC 6066 section 3 forbids an
+            // IP address in the server_name extension, so sending one is a protocol
+            // violation; OpenSSL origins ignore a name they do not recognise, but stricter
+            // ones abort the handshake. An IP configured as the host simply gets no SNI,
+            // and sni_name is the way to give such an upstream a name to use.
+            sys::error_code ip_ec;
+            const net::ip::address parsed = net::ip::make_address(tls_name, ip_ec);
+            const bool is_ip_literal = !ip_ec;
+
+            if (!tls_name.empty() && !is_ip_literal) {
+                SSL_set_tlsext_host_name(self->m_up.native_handle(), tls_name.c_str());
+            }
+
+            // @Usage: Verification is per stream, not per context. The upstream context is
+            // shared by every session, so setting the verify callback there would let one
+            // upstream's hostname assertion leak into another's handshake and make the
+            // result depend on which connection happened to go first.
+            //
+            // @Correctness: The context is left at verify_peer by Server. Downgrading to
+            // verify_none here is the explicit opt out for an upstream whose certificate
+            // this proxy has no CA for. The inverse is never done: verify_tls = true does
+            // not restore checking here, it only declines to remove it, which keeps a
+            // misread flag from quietly enabling verification on an origin the operator
+            // meant to skip.
+            if (self->m_upstream->verify_tls) {
+                self->m_up.set_verify_mode(net::ssl::verify_peer);
+                self->m_up.set_verify_callback(net::ssl::host_name_verification{tls_name});
+            } else {
+                self->m_up.set_verify_mode(net::ssl::verify_none);
             }
 
             self->arm_deadline(self->m_serv_ref->config().get_handshake_ms());
@@ -251,7 +306,7 @@ protected:
 
                 self->m_endpoints = std::move(results);
 
-                // @Usage: net::async_connect (the free function), not the socket member, because
+                // @Note: net::async_connect (the free function), not the socket member, because
                 // the range overload lives in <boost/asio/connect.hpp>. It takes
                 // results_type by const reference and owns the iteration itself, so
                 // m_endpoints must outlive this call, which is why it is a member.
@@ -335,26 +390,19 @@ protected:
     void relay_response() {
         auto self = this->shared_from_this();
 
-        // @Usage: A HEAD response legitimately has no body, so the parser must be told
+        // @Correctness: A HEAD response legitimately has no body, so the parser must be told
         // to stop at the headers. Without skip(true) it waits for body bytes the origin
-        // will never send, and the session hangs until the connection times out.
-        //
-        // @Correctness: The parser is captured by the handler rather than by
-        // reference. async_read outlives this scope, so a reference would dangle, and
-        // get() must not be called until the read has completed.
+        // will never send, and the session hangs until the connection times out. We set up
+        // the parser to be a shared pointer so we don't get a dangling pointer inside the handler
+        // due to how asio works.
         auto parser = std::make_shared<http::response_parser<http::string_body>>();
 
-// @Usage: Bounds the origin leg. The request limit only protects against the
-        // client, and a hostile or broken origin can stream an unbounded response body
-        // into m_up_buf just as easily. Same knob for both directions: one limit to
-        // configure, and a download larger than it is a policy failure, not a bug.
-        //
-        // @Correctness: Never call parser->get() once either of these fires. The message
-        // is incomplete, so get() would read half built fields. The error branch below
-        // returns without touching it.
+        // @Correctness: We set up body and header limits to keep the server response bounded
+        // to a reasonable size.
         parser->body_limit(self->m_serv_ref->config().get_body_bytes());
         parser->header_limit(self->m_serv_ref->config().get_header_bytes());
 
+        // @Note: No body, so let's make the parser skip it instead
         if (self->m_req.method() == http::verb::head) {
             parser->skip(true);
         }
@@ -367,12 +415,7 @@ protected:
 
                     // @Usage: 502 rather than 413 or 431. The client did nothing wrong
                     // here; the origin produced a response larger than this proxy will
-                    // relay, so blaming the client would send it off to fix the wrong
-                    // thing. Both limit breaches land on the same factory, but are logged
-                    // separately because they have different fixes on the origin side.
-                    // @Usage: Compared rather than switched because beast::error_code is
-                    // boost::system::error_code, which has no integral conversion to
-                    // switch on.
+                    // relay, so blaming the client would send it off to fix the wrong thing.
                     if (ec == http::error::body_limit) {
                         std::cerr << "Upstream response body exceeded limits.body_bytes\n";
                     } else if (ec == http::error::header_limit) {
@@ -421,7 +464,7 @@ protected:
                     self->m_resp.base().erase(http::field::content_length);
                 }
 
-                // @Usage: The session handles one request and then closes, so the
+                // @Note: The session handles one request and then closes, so the
                 // response has to say so. Without this a keep-alive client waits for
                 // bytes that never come.
                 self->m_resp.keep_alive(false);
@@ -445,21 +488,23 @@ protected:
         );
     }
 
-    // @Usage: Every path that reports an error is a terminal path for this session, so
-    // the deadline is cancelled here rather than at each call site. Left armed, it would
-    // fire later and write a second, stale response over the same socket, which the
-    // client's next read would pick up instead of the real reply.
-    void send_error(const http::response<http::string_body>& resp) {
+    // @Note: We move the response to the class member m_err and let async_write to send 
+    // m_err to the downstream. Since async_write takes the http response by reference,
+    // passing a reference would make the response a dangling pointer and cause a SEGFAULT 
+    void send_error(http::response<http::string_body> resp) {
         auto self = this->shared_from_this();
 
         self->disarm_deadline();
 
-        http::async_write(self->m_down, resp,
+        self->m_err = std::move(resp);
+
+        http::async_write(self->m_down, self->m_err,
             [self] (const beast::error_code ec, std::size_t) {
 
                 if (ec) {
                     std::cerr << "Error sending the error response to the client\n";
-                }
+                } 
+                
             }
         );
     }

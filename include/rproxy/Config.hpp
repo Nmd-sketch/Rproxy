@@ -17,8 +17,24 @@ struct HostData {
     std::uint16_t port;
     bool uses_tls;
 
-    HostData(std::string_view n, std::string_view h, std::uint16_t p, bool tls)
-        : name(n), host(h), port(p), uses_tls(tls) {}
+    // @Usage: Verify this upstream's certificate chain and hostname. Defaults true; turned
+    // off only for an origin presenting a certificate this proxy has no CA for    
+    bool verify_tls;
+
+    // @Usage: Name to send as SNI and to match the certificate against, when it is not
+    // the host we connect to. Needed when the upstream is reached by IP but the
+    // certificate was issued for a name. Empty means "use host".
+    std::string sni_name;
+
+    HostData(std::string_view n, std::string_view h, std::uint16_t p, bool tls,
+             bool verify = true, std::string_view sni = {})
+        : name(n), host(h), port(p), uses_tls(tls), verify_tls(verify), sni_name(sni) {}
+
+    // @Usage: The name this upstream is known by for TLS purposes, which is what SNI
+    // carries and what the certificate is verified against.
+    const std::string& tls_name() const noexcept {
+        return sni_name.empty() ? host : sni_name;
+    }
 };
 
 class ConfigError : public std::runtime_error {
@@ -32,6 +48,13 @@ class Config {
 
     std::string certificate_path = "certificates/cert.pem";
     std::string key_path = "certificates/key.pem";
+
+    // @Usage: Trust store for verifying upstream certificates, in PEM bundle form.
+    // Empty means no CA is configured, which is only legal when no upstream both
+    // uses TLS and asks to be verified: with nothing to trust, verify_peer would fail
+    // every handshake. load_upstreams rejects that combination rather than letting the
+    // proxy start and then reject traffic it could have diagnosed at startup.
+    std::string ca_file;
 
     std::vector<HostData> upstreams_array;
 
@@ -189,10 +212,13 @@ class Config {
             const std::string host = read_string(*t, "host", ctx, "", errors);
             const auto port_value = read_int(*t, "port", ctx, kMinPort, kMaxPort, 0, errors);
 
-            // @Refactor: parsed and validated, but not yet honoured. The upstream leg is a
-            // plain tcp::socket, so a tls = true upstream still receives plaintext
-            // until M5 dispatches on uses_tls at accept time, per Server::accept.
+            // @Usage: tls = true routes this upstream to an ssl::stream leg, per
+            // Server::accept. verify_tls turns certificate checking on, which is the
+            // default; sni_name overrides the name presented in SNI and matched against
+            // the certificate, for upstreams reached by IP.
             const bool upstream_tls = read_bool(*t, "tls", ctx, false, errors);
+            const bool verify = read_bool(*t, "verify_tls", ctx, true, errors);
+            const std::string sni = read_string(*t, "sni_name", ctx, "", errors);
 
             if (errors.size() != before) {
                 ++index;
@@ -208,7 +234,18 @@ class Config {
                 continue;
             }
 
-            out.emplace_back(name, host, static_cast<std::uint16_t>(port_value), upstream_tls);
+            // @Correctness: An sni_name that is never sent is a silent misconfiguration:
+            // the operator named a certificate, we connected by host, and the mismatch
+            // surfaces as a handshake failure with no hint about the cause. Reject it
+            // here, where the message can still say which key is wrong.
+            if (!sni.empty() && !upstream_tls) {
+                errors.push_back(ctx + ".sni_name has no effect when tls = false");
+                ++index;
+                continue;
+            }
+
+            out.emplace_back(name, host, static_cast<std::uint16_t>(port_value), upstream_tls,
+                             verify, sni);
             ++index;
         }
     }
@@ -233,6 +270,7 @@ public:
             if (const auto* tls = (*server)["tls"].as_table(); tls) {
                 certificate_path = read_string(*tls, "cert", tls_ctx, certificate_path, errors);
                 key_path = read_string(*tls, "key", tls_ctx, key_path, errors);
+                ca_file = read_string(*tls, "ca_file", tls_ctx, ca_file, errors);
             }
         }
 
@@ -262,6 +300,21 @@ public:
 
         load_upstreams(root, upstreams_array, errors);
 
+        // @Correctness: Checked here rather than left to the handshake. A TLS upstream
+        // that asks to be verified but has no ca_file would otherwise start cleanly and
+        // then fail every request to that origin with a 502 that says nothing about the
+        // real cause. Startup is the only place this is still cheap to diagnose.
+        if (ca_file.empty()) {
+            for (const auto& up : upstreams_array) {
+                if (up.uses_tls && up.verify_tls) {
+                    errors.push_back("upstream '" + up.name +
+                        "' uses TLS and asks to be verified, but server.tls.ca_file is not "
+                        "set. Add a ca_file, or set verify_tls = false on that upstream to "
+                        "accept an unverified origin certificate.");
+                }
+            }
+        }
+
         if (!errors.empty()) {
             std::string message = "Invalid configuration:";
             for (const auto& e : errors) {
@@ -279,6 +332,7 @@ public:
 
     const std::string& get_certificate_path() const noexcept { return certificate_path; }
     const std::string& get_key_path() const noexcept { return key_path; }
+    const std::string& get_ca_file() const noexcept { return ca_file; }
 
     const std::vector<HostData>& get_upstreams() const noexcept { return upstreams_array; }
 

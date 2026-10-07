@@ -52,6 +52,7 @@ threads = 4
 [server.tls]
 cert = "folder/cert.pem"
 key = "folder/key.pem"
+ca_file = "folder/ca.pem"
 
 [[upstream]]
 name = "backend"
@@ -131,6 +132,9 @@ read_ms = 1000
 TEST(Config, MultipleUpstreamsPreserveOrder)
 {
     const Config config(parse_ok(R"(
+[server.tls]
+ca_file = "ca.pem"
+
 [[upstream]]
 name = "first"
 host = "10.0.0.1"
