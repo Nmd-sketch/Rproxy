@@ -18,7 +18,7 @@ void Server::accept() {
             auto buf = std::make_shared<beast::flat_buffer>();
             auto socket = std::make_shared<net::ip::tcp::socket>(std::move(client));
 
-		if (!ec) {
+            if (!ec) {
                 // @Usage: Captured here because this is the last point where the raw
                 // socket exists. Once wrapped in an ssl_stream the IP would need
                 // next_layer() on one type and the socket itself on the other.
@@ -31,9 +31,58 @@ void Server::accept() {
                     }
                 }
 
-                beast::async_detect_ssl(*socket, *buf,
-                        [this, socket, buf, client_ip] (const beast::error_code ec, bool result) mutable {
+                // @Usage: A connection that is accepted but never classifies gets killed here.
+                //
+                // @Correctness: This is the only deadline covering the window between
+                // accept and async_detect_ssl completing, because detect_ssl cannot
+                // classify a leg until the client has sent enough bytes and nothing arms
+                // a timer until a session exists. handshake_ms is the matching budget:
+                // it guards the same handshake this window delays. The 3 second literal
+                // this replaced ignored the configuration entirely.
+                auto conn_timer = std::make_shared<net::steady_timer>(m_io_ctx.get_executor());
+                conn_timer->expires_after(m_config.get_handshake_ms());
+                conn_timer->async_wait(
+                    [this, socket] (const sys::error_code ec) {
 
+                        // @Correctness: Cancelling the timer is the SUCCESS path here, not a
+                        // failure. Every connection that speaks has its timer cancelled by
+                        // the detect_ssl handler, and a cancelled wait still runs its
+                        // handler, so logging here printed one operation_aborted line per
+                        // successful request. Only genuine timer errors are worth reporting.
+                        if (ec == net::error::operation_aborted) {
+                            return;
+                        }
+
+                        if (ec) {
+                            std::cerr << "Error: " << ec.what() << '\n';
+                            return;
+                        }
+                        
+                        // @Correctness: We send error 504 to the client socket before killing the socket, close when
+                        // the handle runs.
+                        auto resp = std::make_shared<http::response<http::string_body>>(ErrorResponse::make_error_504(10));
+                        http::async_write(*socket, *resp, 
+                                [this, socket, resp] (const beast::error_code ec, std::size_t bytes) {
+                                   
+                                    if (ec) {
+                                        std::cerr << "Error sending err response to client: " << ec.what() << '\n';
+                                    }
+                                    
+
+                                    sys::error_code close_ec;
+                                    socket->close(close_ec);
+
+                                }
+                        );
+
+                    } 
+                );
+
+                beast::async_detect_ssl(*socket, *buf,
+                        [this, socket, buf, client_ip, conn_timer] (const beast::error_code ec, bool result) mutable {
+                            
+                            // @Note: The server sent data, we can disarm the timer and proceed
+                            conn_timer->cancel();
 
                             if (ec) {
                                 std::cerr << "SSL detection error\n";
@@ -74,7 +123,10 @@ void Server::accept() {
                         }
                 );
 
-			} else {
+			} else if (ec != net::error::operation_aborted) {
+				// @Usage: operation_aborted is the expected outcome of stop(), which closes
+				// the acceptor to unwind the pending accept. Logging it turned every normal
+				// shutdown into a stream of errors that look like faults worth chasing.
 				std::cerr << "Error accepting client: " << ec.what() << '\n';
 			}
 
@@ -84,8 +136,8 @@ void Server::accept() {
 			// and only the flag rules out both.
 			if (!m_stopping.load(std::memory_order_relaxed)) {
 				this->accept();
-			} else {
-			}
+			} 
+			
 		}
 	);
 }

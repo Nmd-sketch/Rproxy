@@ -721,6 +721,93 @@ http::response<http::string_body> get_through_proxy_tls(std::uint16_t proxy_port
     return resp;
 }
 
+// Polls a predicate with a bound. Used where the question is "did the other side close",
+// which otherwise has no way to fail: it would just hang.
+template <typename Pred>
+bool wait_until(Pred pred, int milliseconds) {
+    const auto deadline = steady_ms() + milliseconds;
+    while (steady_ms() < deadline) {
+        if (pred()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    return pred();
+}
+
+// Reads until the peer closes, discarding anything it sends on the way.
+//
+// @Correctness: Discarding matters. A test that deliberately never reads the response
+// still has those bytes sitting in its receive buffer, so a single read would come back
+// clean and the close would go unnoticed. EOF and a reset both count as closed; anything
+// else, including the receive timeout, means the leg is still open, which is the failure
+// these helpers exist to report.
+bool read_until_peer_close(net::ip::tcp::socket& sock, int wait_seconds) {
+    set_io_timeout(sock, wait_seconds);
+
+    char buf[256];
+    const auto deadline = steady_ms() + wait_seconds * 1000;
+
+    while (steady_ms() < deadline) {
+        sys::error_code ec;
+        sock.read_some(net::buffer(buf), ec);
+
+        if (ec == net::error::eof || ec == net::error::connection_reset) {
+            return true;
+        }
+        if (ec) {
+            return false;
+        }
+    }
+    return false;
+}
+
+// @Usage: A client socket already connected to the proxy, for tests that need to control
+// exactly what goes out and when. send_through_proxy always sends a complete request and
+// always reads the response, which is precisely what the stall tests cannot do.
+struct RawClient {
+    net::io_context ioc;
+    net::ip::tcp::resolver res{ioc};
+    net::ip::tcp::socket sock{ioc};
+
+    // @Correctness: Bounded up front. These tests deliberately provoke a proxy that never
+    // answers, and an unbounded blocking read would hang the suite instead of failing the
+    // assertion that follows it.
+    static constexpr int kReceiveTimeoutSeconds = 12;
+
+    explicit RawClient(std::uint16_t port) {
+        const auto endpoints = res.resolve("127.0.0.1", std::to_string(port));
+        sock.connect(*endpoints.begin());
+        set_io_timeout(sock, kReceiveTimeoutSeconds);
+    }
+
+    void send(std::string_view data) {
+        sys::error_code ec;
+        net::write(sock, net::buffer(data.data(), data.size()), ec);
+    }
+
+    // The error is handed back rather than thrown so one helper serves both callers that
+    // expect a payload and callers that expect only a close.
+    http::response<http::string_body> read_response(beast::error_code& ec) {
+        beast::flat_buffer buffer;
+        http::response<http::string_body> resp;
+        http::read(sock, buffer, resp, ec);
+        return resp;
+    }
+
+    bool wait_for_close(int seconds) { return read_until_peer_close(sock, seconds); }
+};
+
+// @Usage: The origin side of "both legs closed". The origin records whether the proxy let
+// go of the connection, which is the half a client-side assertion cannot see.
+struct UpstreamCloseProbe {
+    std::atomic<bool> closed{false};
+
+    void observe(net::ip::tcp::socket& sock) {
+        closed.store(read_until_peer_close(sock, kOriginIoTimeoutSeconds));
+    }
+};
+
 // Reads a header value from a captured raw request, matching the field name exactly.
 // A substring search would report X-Keep-Alive: as Keep-Alive:, so the line has to be
 // matched at the start of the field name.
@@ -1001,6 +1088,240 @@ TEST(Proxy, TimesOutWhenAClientStallsBeforeSendingARequest)
 
     ASSERT_FALSE(ec) << "expected a 504 response, got: " << ec.message();
     EXPECT_EQ(resp.result_int(), 504);
+}
+
+// The cases below all assert the same contract from different stall points: once the
+// deadline gives up, BOTH legs must be closed. Asserting only the 504 is not enough,
+// because a proxy that sends the error and then keeps the session alive has still leaked
+// it. Each test therefore ends by checking the client socket reaches EOF and, where an
+// origin connection exists, that the origin saw the proxy close its side too.
+
+// @Usage: The client connects and sends not one byte.
+//
+// @Correctness: This is the first stall point there is, and it is BEFORE any deadline is
+// armed. async_detect_ssl decides plain versus TLS by peeking at the first bytes, so a
+// client that sends nothing leaves the session parked in detection with no timer running
+// at all. The arm in SessionBase::start only happens once detection has completed.
+TEST(Proxy, ClosesTheClientConnectionWhenTheClientNeverSendsAnything)
+{
+    const RunningProxy proxy("stallnothing", "", 1500);
+
+    RawClient client(proxy.port());
+
+    beast::error_code ec;
+    const auto resp = client.read_response(ec);
+
+    ASSERT_FALSE(ec) << "expected a 504 before any close, got: " << ec.message();
+    EXPECT_EQ(resp.result_int(), 504);
+
+    EXPECT_TRUE(client.wait_for_close(8))
+        << "downstream leg stayed open after the deadline";
+}
+
+// @Usage: The client sends headers declaring a body, then stops mid body.
+//
+// @Correctness: No upstream assertion here, and that is the point rather than an
+// omission. The proxy only calls connect_upstream() after the request has parsed in
+// full, so a client that stalls mid body has no origin connection at all. Asserting the
+// upstream leg closed would be asserting something that cannot be true; the legs only
+// coexist once a request has been forwarded.
+TEST(Proxy, ClosesTheClientConnectionWhenTheClientStallsMidRequestBody)
+{
+    const RunningProxy proxy("stallbody", "", 1500);
+
+    RawClient client(proxy.port());
+    client.send("POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 100\r\n\r\nshort");
+
+    beast::error_code ec;
+    const auto resp = client.read_response(ec);
+
+    ASSERT_FALSE(ec) << "expected a 504 before any close, got: " << ec.message();
+    EXPECT_EQ(resp.result_int(), 504);
+
+    EXPECT_TRUE(client.wait_for_close(8))
+        << "downstream leg stayed open after the deadline";
+}
+
+// @Usage: A TLS client leg that never completes its handshake.
+//
+// @Correctness: The lone record tag is deliberate. async_detect_ssl classifies the leg by
+// the first byte, so without some bytes the session never reaches the handshake and this
+// would only retest the detection stall above. 0x16 is the handshake record type, which
+// commits the session to TLS and then leaves the handshake itself hanging.
+TEST(Proxy, ClosesTheClientConnectionWhenATlsClientNeverCompletesTheHandshake)
+{
+    const RunningProxy proxy("stalltls", "", 1500);
+
+    RawClient client(proxy.port());
+    const unsigned char handshake_record = 0x16;
+    client.send(std::string_view(reinterpret_cast<const char*>(&handshake_record), 1));
+
+    EXPECT_TRUE(client.wait_for_close(8))
+        << "downstream leg stayed open with the TLS handshake unfinished";
+}
+
+// @Usage: The client never reads the 504 it was sent, which is the case that bounds the
+// drain of the error write rather than the read that produced it.
+TEST(Proxy, ClosesBothLegsWhenTheClientNeverReadsTheErrorResponse)
+{
+    UpstreamCloseProbe probe;
+    JoinedOrigin origin;
+    const auto origin_port = origin.port();
+
+    origin.serve_loop([&origin, &probe](net::ip::tcp::socket& sock) {
+        sys::error_code ec;
+        set_io_timeout(sock, kOriginIoTimeoutSeconds);
+
+        beast::flat_buffer buffer;
+        http::request<http::string_body> req;
+        http::read(sock, buffer, req, ec);
+        if (ec) {
+            return;
+        }
+
+        // Answer only after the proxy's read deadline has already fired, so the deadline
+        // lands while this reply is in flight. That late reply is what used to turn into
+        // a second response on the client connection.
+        for (int i = 0; i < 20 && !origin.stopping(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        static const std::string reply =
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+            "Content-Length: 4\r\n\r\nLATE";
+        net::write(sock, net::buffer(reply), ec);
+
+        probe.observe(sock);
+    });
+
+    const RunningProxy proxy("stallread", upstream_block_for(origin_port), 1500);
+
+    RawClient client(proxy.port());
+    client.send("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
+
+    // Deliberately never read the response.
+    EXPECT_TRUE(client.wait_for_close(8))
+        << "downstream leg stayed open with an unread error response";
+    EXPECT_TRUE(wait_until([&probe] { return probe.closed.load(); }, 8000))
+        << "upstream leg stayed open";
+}
+
+// @Usage: The same, on the success path. Included as the control: nothing in the timeout
+// handling runs here, so this passes only because the session tears itself down normally.
+// If it ever fails, the timeout fix has leaked a lifetime change into the happy path.
+TEST(Proxy, ClosesBothLegsWhenTheClientNeverReadsASuccessfulResponse)
+{
+    UpstreamCloseProbe probe;
+    JoinedOrigin origin;
+    const auto origin_port = origin.port();
+
+    origin.serve_loop([&probe](net::ip::tcp::socket& sock) {
+        sys::error_code ec;
+        set_io_timeout(sock, kOriginIoTimeoutSeconds);
+
+        beast::flat_buffer buffer;
+        http::request<http::string_body> req;
+        http::read(sock, buffer, req, ec);
+        if (ec) {
+            return;
+        }
+
+        static const std::string reply =
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+            "Content-Length: 4\r\n\r\nBODY";
+        net::write(sock, net::buffer(reply), ec);
+
+        probe.observe(sock);
+    });
+
+    const RunningProxy proxy("stallsuccess", upstream_block_for(origin_port), 30000);
+
+    RawClient client(proxy.port());
+    client.send("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
+
+    EXPECT_TRUE(client.wait_for_close(8))
+        << "downstream leg stayed open with an unread success response";
+    EXPECT_TRUE(wait_until([&probe] { return probe.closed.load(); }, 8000))
+        << "upstream leg stayed open";
+}
+
+// @Usage: Two connections inside the detection window at the same time.
+//
+// @Correctness: The window is the interval between accept() and async_detect_ssl
+// completing, and it is where the per-connection timer has to be armed and owned. With a
+// single server-wide timer, accepting the second connection cancels the first one's wait,
+// and the first connection gets closed even though it is perfectly healthy and about to
+// speak. Holding both sockets open before either sends a byte is what puts them in that
+// window together; the sleep in between guarantees the proxy really has accepted the first
+// and armed its timer, rather than both arriving inside the same acceptor wakeup.
+TEST(Proxy, ServesTwoConnectionsThatBothSpeakBeforeEitherIsClassified)
+{
+    StubOrigin origin("ORIGIN-BODY-X");
+    const RunningProxy proxy("race2", upstream_block_for(origin.port()), 30000);
+
+    static const std::string request = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+    RawClient first(proxy.port());
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    RawClient second(proxy.port());
+
+    first.send(request);
+    beast::error_code first_ec;
+    const auto first_resp = first.read_response(first_ec);
+
+    ASSERT_FALSE(first_ec) << "first connection got: " << first_ec.message();
+    EXPECT_EQ(first_resp.result_int(), 200)
+        << "a second connection arriving must not close a healthy first one";
+    EXPECT_EQ(first_resp.body(), "ORIGIN-BODY-X");
+
+    // One response and nothing after it. A cancelled timer that wrongly falls through
+    // would try to write a 504 here as well, so this doubles as the guard for that path.
+    EXPECT_TRUE(first.wait_for_close(8))
+        << "trailing data or a missing close on the first connection";
+
+    second.send(request);
+    beast::error_code second_ec;
+    const auto second_resp = second.read_response(second_ec);
+
+    ASSERT_FALSE(second_ec) << "second connection got: " << second_ec.message();
+    EXPECT_EQ(second_resp.result_int(), 200);
+    EXPECT_EQ(second_resp.body(), "ORIGIN-BODY-X");
+}
+
+// @Usage: The mirror image of the case above. A stalled connection's timer must survive
+// another connection being accepted.
+//
+// @Correctness: With a single shared timer the reverse damage is worse than killing a
+// healthy connection: a healthy arrival cancels the stalled connection's wait, so the
+// stalled one never times out at all and is pinned for as long as the client cares to
+// hold the socket open. That is precisely the denial of service the connection timer
+// exists to prevent, and it is why the timer has to be owned by the connection.
+TEST(Proxy, TimesOutAStalledConnectionWhileAnotherConnectionIsServed)
+{
+    StubOrigin origin("ORIGIN-BODY-X");
+    const RunningProxy proxy("racestall", upstream_block_for(origin.port()), 30000);
+
+    static const std::string request = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+    RawClient stalled(proxy.port());
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    RawClient healthy(proxy.port());
+    healthy.send(request);
+
+    beast::error_code healthy_ec;
+    const auto healthy_resp = healthy.read_response(healthy_ec);
+    ASSERT_FALSE(healthy_ec) << "healthy connection got: " << healthy_ec.message();
+    EXPECT_EQ(healthy_resp.result_int(), 200);
+    EXPECT_EQ(healthy_resp.body(), "ORIGIN-BODY-X");
+
+    // Only arrives if the healthy connection left this one's timer running.
+    beast::error_code stalled_ec;
+    const auto stalled_resp = stalled.read_response(stalled_ec);
+    ASSERT_FALSE(stalled_ec) << "stalled connection got: " << stalled_ec.message();
+    EXPECT_EQ(stalled_resp.result_int(), 504);
+
+    EXPECT_TRUE(stalled.wait_for_close(8)) << "downstream leg stayed open";
 }
 
 TEST(Proxy, Returns400OnAMalformedRequestLine)

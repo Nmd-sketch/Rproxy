@@ -104,6 +104,12 @@ protected:
     // upstream leg.
     net::steady_timer m_deadline;
 
+    // @Usage: Drain budget for an error response. Long enough that the 504 lands in any
+    // real socket buffer, short enough that a client which never reads cannot hold the
+    // session. Deliberately not configurable: it bounds a flush we control, not a
+    // network condition the operator is describing.
+    static constexpr std::chrono::milliseconds kErrorDrainGrace{1000};
+
     void arm_deadline(std::chrono::milliseconds budget) {
         m_deadline.expires_after(budget);
         m_deadline.async_wait(
@@ -119,22 +125,25 @@ protected:
                     return;
                 }
 
-                // @Refactor: cancel() here cancels the timer only, not the socket
-                // operation it was guarding. If the deadline fires while an upstream
-                // read is pending, that read stays in flight and can still complete
-                // later, writing a second response after this 504. No test reaches it:
-                // a silent origin closes once the deadline passes, so the second write
-                // just fails. Closing the in flight operation on timeout needs session
-                // lifecycle changes.
                 self->m_deadline.cancel();
+
                 std::cerr << "Upstream step timed out\n";
                 self->send_error(ErrorResponse::make_error_504(self->m_req.version()));
             }
         );
     }
 
+    void close_upstream_and_downstream() {
+        //@Note: Even if close returns an error, the underlying socket descriptor
+        //gets closed by the OS. Which is what we want anyways,
+        sys::error_code close_ec;
+        beast::get_lowest_layer(m_down).close(close_ec);
+        beast::get_lowest_layer(m_up).close(close_ec);
+    }
+
     void disarm_deadline() {
         m_deadline.cancel();
+        m_deadline.expires_at(std::chrono::steady_clock::now());
     }
 
     void read_request() {
@@ -495,15 +504,44 @@ protected:
         auto self = this->shared_from_this();
 
         self->disarm_deadline();
-
         self->m_err = std::move(resp);
+
+//@Correctness: How long the client gets to accept the error response before both
+        //legs are forced shut, so a client that stalls mid response cannot pin the
+        //session forever. The expiry must be stated here: disarm_deadline() deliberately
+        //leaves the timer already expired, so a bare async_wait would inherit that and
+        //close both legs immediately instead of draining. That happened to still deliver
+        //the response because the write was queued first and won the race, which is a
+        //scheduling accident rather than a property to rely on.
+        m_deadline.expires_after(kErrorDrainGrace);
+        m_deadline.async_wait(
+            [self] (const sys::error_code ec) {
+
+                // @Correctness: A cancelled wait still runs its handler, with
+                //operation_aborted. The write completing calls disarm_deadline(), so
+                // without this guard every successful error response logged a spurious
+                // "error sending the error response" on its way out.
+                if (ec == net::error::operation_aborted) {
+                    return;
+                }
+
+                if (ec) {
+                    std::cerr << "Error: " << ec.what() << '\n';
+                }
+
+                self->close_upstream_and_downstream();
+            }
+        );
 
         http::async_write(self->m_down, self->m_err,
             [self] (const beast::error_code ec, std::size_t) {
 
                 if (ec) {
                     std::cerr << "Error sending the error response to the client\n";
-                } 
+                }
+
+                self->disarm_deadline();
+                self->close_upstream_and_downstream();
                 
             }
         );
@@ -527,15 +565,26 @@ public:
     void start() {
         if constexpr (is_ssl_stream_v<DownStream>) {
             auto self = this->shared_from_this();
-
+            
+            //@Correctness: Set up a deadline to prevent the client from never completing
+            //the async handshake and pinning the session forever.
+            //
+            //@Correctness: handshake_ms, not read_ms. This budget covers the TLS
+            //handshake and nothing else; read_ms guards the request that comes after it.
+            //Borrowing read_ms happens to agree whenever both are configured the same,
+            //and then quietly kills a legitimate slow handshake on a client that was
+            //configured with a tight read budget.
+            self->arm_deadline(this->m_serv_ref->config().get_handshake_ms());
             m_down.async_handshake(net::ssl::stream_base::server, m_buf.data(),
                 [self] (const sys::error_code& ec, std::size_t bytes) {
 
                     if (ec) {
                         std::cerr << "TLS handshake error: " << ec.message() << '\n';
+                        self->disarm_deadline();    
                         return;
                     }
 
+                    self->disarm_deadline();    
                     self->m_buf.consume(self->m_buf.size());
                     std::cout << "TLS handshake done, reading request\n";
 

@@ -78,7 +78,8 @@ public:
     , m_up_ssl_ctx(net::ssl::context::tlsv12_client)
     , m_io_ctx(), m_config(config_path)
     , m_load_balancer(m_config, m_io_ctx)
-    , m_acceptor(m_io_ctx, net::ip::tcp::endpoint(net::ip::tcp::v4(), m_config.get_port())) {
+    , m_acceptor(m_io_ctx, net::ip::tcp::endpoint(net::ip::tcp::v4(), m_config.get_port()))
+    {
 
 		m_ssl_ctx.use_certificate_chain_file(m_config.get_certificate_path());
 		m_ssl_ctx.use_private_key_file(m_config.get_key_path(), net::ssl::context::pem);
